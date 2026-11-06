@@ -39,9 +39,11 @@ impl SubscriptionHandler for Ports {
     ) -> PortFuture<'a, tokio::sync::mpsc::Receiver<Result<serde_json::Value, serde_json::Value>>>
     {
         Box::pin(async {
-            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
             tx.send(Ok(json!(1))).await.unwrap();
             tx.send(Ok(json!("bad"))).await.unwrap();
+            tx.send(Err(json!({"reason":"failed"}))).await.unwrap();
+            tx.send(Err(json!("invalid"))).await.unwrap();
             rx
         })
     }
@@ -62,7 +64,7 @@ async fn subscription_events_are_validated() {
                 kind: Kind::Subscription,
                 input_schema: json!(true),
                 output_schema: json!(true),
-                error_schema: json!(true),
+                error_schema: json!({"type":"object"}),
                 event_schema: json!({"type":"integer"}),
                 required_capabilities: vec![],
                 confirmation_required: false,
@@ -83,6 +85,16 @@ async fn subscription_events_are_validated() {
     assert!(matches!(
         subscription.recv().await,
         Some(Err(DispatchError::InvalidEvent(_)))
+    ));
+    assert_eq!(
+        subscription.recv().await,
+        Some(Err(DispatchError::SubscriptionSource(
+            json!({"reason":"failed"})
+        )))
+    );
+    assert!(matches!(
+        subscription.recv().await,
+        Some(Err(DispatchError::InvalidError(_)))
     ));
     assert_eq!(subscription.recv().await, None);
     assert_eq!(dispatcher.validate_event(&id, &json!(1)), Ok(()));

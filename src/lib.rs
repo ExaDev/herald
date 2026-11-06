@@ -153,6 +153,7 @@ pub trait SubscriptionHandler: Send + Sync {
 pub struct Subscription {
     receiver: mpsc::Receiver<Result<Value, Value>>,
     validator: Arc<jsonschema::Validator>,
+    error_validator: Arc<jsonschema::Validator>,
 }
 
 impl Subscription {
@@ -160,7 +161,12 @@ impl Subscription {
     pub async fn recv(&mut self) -> Option<Result<Value, DispatchError>> {
         let event = match self.receiver.recv().await? {
             Ok(event) => event,
-            Err(error) => return Some(Err(DispatchError::SubscriptionSource(error))),
+            Err(error) => {
+                return Some(match self.error_validator.validate(&error) {
+                    Ok(()) => Err(DispatchError::SubscriptionSource(error)),
+                    Err(invalid) => Err(DispatchError::InvalidError(invalid.to_string())),
+                });
+            }
         };
         Some(
             self.validator
@@ -202,13 +208,31 @@ impl Drop for InFlight<'_> {
     }
 }
 
+struct SubscriptionInFlight<'a> {
+    observer: &'a dyn Observer,
+    clock: &'a dyn Clock,
+    request: &'a Request,
+    completed: bool,
+}
+impl Drop for SubscriptionInFlight<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.observer.subscription_opened(
+                self.request,
+                self.clock.now(),
+                &Err(DispatchError::OutcomeLost),
+            );
+        }
+    }
+}
+
 struct Entry {
     contract: Contract,
     handler: Option<Arc<dyn Handler>>,
     subscription: Option<Arc<dyn SubscriptionHandler>>,
     input: jsonschema::Validator,
     output: jsonschema::Validator,
-    error: jsonschema::Validator,
+    error: Arc<jsonschema::Validator>,
     event: Arc<jsonschema::Validator>,
 }
 
@@ -287,7 +311,7 @@ impl Dispatcher {
                 subscription,
                 input,
                 output,
-                error,
+                error: Arc::new(error),
                 event: Arc::new(event),
             },
         );
@@ -357,10 +381,18 @@ impl Dispatcher {
         if cancellation.is_cancelled() {
             return Err(DispatchError::CancelledBeforeDispatch);
         }
+        let mut in_flight = SubscriptionInFlight {
+            observer: self.observer.as_ref(),
+            clock: self.clock.as_ref(),
+            request,
+            completed: false,
+        };
         let receiver = handler.subscribe(request, cancellation).await;
+        in_flight.completed = true;
         Ok(Subscription {
             receiver,
             validator: entry.event.clone(),
+            error_validator: entry.error.clone(),
         })
     }
 
