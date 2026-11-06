@@ -8,9 +8,9 @@ Applications own their operations, business rules, permissions and user workflow
 
 ## Architecture
 
-A product registers versioned operations, queries and subscriptions with input, output, error and event schemas, semantic metadata and handlers. A dispatcher validates and routes requests through product-supplied identity, authorisation and observability ports. Adapters translate the same contracts into interfaces; product policy stays in the product.
+A product registers versioned operations, queries and subscriptions with input, output, error and event schemas, semantic metadata and handlers. The in-process dispatcher validates and routes requests through product-supplied authorisation, confirmation, clock and observability ports. Identity and confirmation claims require verification by those product-supplied ports; a caller-provided value is not proof. Future adapters will translate the same contracts into interfaces, while product policy stays in the product.
 
-The runtime supports in-process composition and remote invocation through transport contracts. Persistence is supplied through an asynchronous storage contract. Stable operation IDs, idempotency, cancellation and replay apply where the bound runtime and operation support them; an unknown outcome after host loss must not be treated as an automatic failure or a safe retry.
+The intended runtime supports in-process composition and remote invocation through transport contracts, with persistence supplied through an asynchronous storage contract. The current in-process dispatcher does not provide durable operation IDs, result recovery, idempotency or replay. Cancellation is cooperative; a lost outcome must not be treated as an automatic failure or a safe retry.
 
 Durable operation events, ephemeral media and input streams, and inference streams have different ordering, backpressure and recovery requirements. Adapters must preserve those semantics rather than force them into one replay model. Existing protocol-compatible inference endpoints remain product-owned.
 
