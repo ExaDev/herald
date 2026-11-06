@@ -80,6 +80,15 @@ impl Device for FakeDevice {
         Err(Error::AmbiguousControl("lost response".into()))
     }
 }
+struct DeviceRead(Arc<FakeDevice>);
+impl Handler for DeviceRead {
+    fn invoke<'a>(&'a self, _: &'a Request, _: Cancellation) -> PortFuture<'a, Outcome> {
+        Box::pin(async move {
+            let status = self.0.status().await.unwrap();
+            Outcome::Success(serde_json::to_value(status).unwrap())
+        })
+    }
+}
 struct DeviceAdapter(Arc<FakeDevice>);
 impl Handler for DeviceAdapter {
     fn invoke<'a>(&'a self, _: &'a Request, _: Cancellation) -> PortFuture<'a, Outcome> {
@@ -114,6 +123,32 @@ fn contract(name: &str) -> Contract {
         support: Support::Supported,
     }
 }
+#[tokio::test]
+async fn pinned_kvm_device_status_is_read_through_dispatch() {
+    let device = Arc::new(FakeDevice(AtomicUsize::new(0)));
+    let ports = Arc::new(Ports);
+    let mut dispatcher = Dispatcher::new(ports.clone(), ports.clone(), ports.clone(), ports);
+    let mut spec = contract("status");
+    spec.kind = Kind::Query;
+    spec.confirmation_required = false;
+    let request = Request {
+        capability: spec.id.clone(),
+        identity: "allowed".into(),
+        input: json!({}),
+        confirmed: false,
+    };
+    dispatcher
+        .register(spec, Arc::new(DeviceRead(device.clone())))
+        .unwrap();
+    let (_sender, signal) = cancellation();
+    let expected = serde_json::to_value(device.status().await.unwrap()).unwrap();
+    assert_eq!(
+        dispatcher.dispatch(request, signal).await,
+        Ok(Outcome::Success(expected))
+    );
+    assert_eq!(device.0.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn pinned_kvm_device_preserves_ambiguous_control_without_retry() {
     let device = Arc::new(FakeDevice(AtomicUsize::new(0)));
