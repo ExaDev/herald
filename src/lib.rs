@@ -337,7 +337,7 @@ impl Dispatcher {
             .subscription
             .as_ref()
             .ok_or(DispatchError::WrongCapabilityKind)?;
-        if !self.authorizer.authorize(&request, &entry.contract).await {
+        if !self.authorizer.authorize(request, &entry.contract).await {
             return Err(DispatchError::Denied);
         }
         match entry.contract.support {
@@ -346,7 +346,7 @@ impl Dispatcher {
             Support::Unknown => return Err(DispatchError::SupportUnknown),
         }
         if entry.contract.confirmation_required
-            && !self.confirmer.confirm(&request, &entry.contract).await
+            && !self.confirmer.confirm(request, &entry.contract).await
         {
             return Err(DispatchError::ConfirmationRequired);
         }
@@ -357,7 +357,7 @@ impl Dispatcher {
         if cancellation.is_cancelled() {
             return Err(DispatchError::CancelledBeforeDispatch);
         }
-        let receiver = handler.subscribe(&request, cancellation).await;
+        let receiver = handler.subscribe(request, cancellation).await;
         Ok(Subscription {
             receiver,
             validator: entry.event.clone(),
