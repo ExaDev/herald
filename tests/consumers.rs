@@ -144,6 +144,43 @@ async fn independent_device_and_service_observe_policy_validation_and_unknown_ou
     assert_eq!(audit.0.load(Ordering::SeqCst), 5);
 }
 #[tokio::test]
+async fn schema_versions_accept_their_own_inputs_without_coercion() {
+    let mut dispatcher = Dispatcher::new(
+        Arc::new(Policy),
+        Arc::new(Policy),
+        Arc::new(TestClock),
+        Arc::new(Audit::default()),
+    );
+    dispatcher.register(contract("status", 1, false, json!({"type":"object", "additionalProperties":false, "properties":{"name":{"type":"string"}}})), Arc::new(Service)).unwrap();
+    dispatcher.register(contract("status", 2, false, json!({"type":"object", "required":["id"], "additionalProperties":false, "properties":{"id":{"type":"integer"}}})), Arc::new(Service)).unwrap();
+    let (_sender, signal) = cancellation();
+    assert_eq!(
+        dispatcher
+            .dispatch(request("status", 1, json!({"name":"one"})), signal.clone())
+            .await,
+        Ok(Outcome::Success(json!({"name":"one"})))
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(request("status", 2, json!({"id":2})), signal.clone())
+            .await,
+        Ok(Outcome::Success(json!({"id":2})))
+    );
+    assert!(matches!(
+        dispatcher
+            .dispatch(request("status", 1, json!({"id":2})), signal.clone())
+            .await,
+        Err(DispatchError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        dispatcher
+            .dispatch(request("status", 2, json!({"name":"one"})), signal)
+            .await,
+        Err(DispatchError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
 async fn versions_are_independent_and_pre_cancelled_work_does_not_run() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut dispatcher = Dispatcher::new(
