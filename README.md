@@ -1,10 +1,10 @@
-# Capability Surface
+# Herald
 
-Capability Surface is a proposed product-neutral framework for declaring application capabilities once and exposing them through multiple interfaces. The repository is at the design stage: the interfaces and implementations described below are goals, not available functionality.
+Herald is a proposed product-neutral framework for declaring application capabilities once and exposing them through multiple interfaces. The repository is at the design stage: the interfaces and implementations described below are goals, not available functionality.
 
 ## Purpose
 
-Applications own their operations, business rules, permissions and user workflows. Capability Surface supplies reusable contracts and adapters so those operations can be invoked consistently from MCP, APIs, command-line interfaces, terminal interfaces, web applications and native applications. Products remain independently usable and do not need a shared daemon or database.
+Applications own their operations, business rules, permissions and user workflows. Herald supplies reusable contracts and adapters so those operations can be invoked consistently from MCP, APIs, command-line interfaces, terminal interfaces, web applications and native applications. Products remain independently usable and do not need a shared daemon or database.
 
 ## Architecture
 
@@ -27,6 +27,6 @@ Schemas describe data, not a complete user experience or a security policy. Pres
 
 ## Boundaries
 
-Capability Surface is not a fleet scheduler, model server, device driver, agent runtime or shared product UI. Applications provide their own policy, storage, operation handlers and domain models. Identity and transport libraries can be composed at the edge; the framework does not replace them or require every consumer to use the same one.
+Herald is not a fleet scheduler, model server, device driver, agent runtime or shared product UI. Applications provide their own policy, storage, operation handlers and domain models. Identity and transport libraries can be composed at the edge; the framework does not replace them or require every consumer to use the same one.
 
 The initial implementation should be validated against both an in-process device application and a durable multi-client service. Contract and adapter tests must cover equivalent semantic outcomes, denial, validation, cancellation and ambiguous mutations across the surfaces that expose each operation.
