@@ -364,6 +364,16 @@ impl Dispatcher {
         })
     }
 
+    /// Starts an in-process operation independently of the caller's wait. Dropping the returned handle detaches the task; it does not cancel the operation. Runtime or process loss can still leave its outcome unknown.
+    pub fn start(
+        self: &Arc<Self>,
+        request: Request,
+        cancellation: Cancellation,
+    ) -> tokio::task::JoinHandle<Result<Outcome, DispatchError>> {
+        let dispatcher = Arc::clone(self);
+        tokio::spawn(async move { dispatcher.dispatch(request, cancellation).await })
+    }
+
     /// Validates and authorises a request before invoking its handler once.
     pub async fn dispatch(
         &self,

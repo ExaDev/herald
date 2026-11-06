@@ -31,6 +31,65 @@ impl Handler for Ports {
         Box::pin(std::future::pending())
     }
 }
+struct Completion(tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+impl Handler for Completion {
+    fn invoke<'a>(&'a self, _: &'a Request, _: Cancellation) -> PortFuture<'a, Outcome> {
+        Box::pin(async move {
+            self.0.lock().await.take().unwrap().await.unwrap();
+            Outcome::Success(json!(null))
+        })
+    }
+}
+#[tokio::test]
+async fn detached_operation_finishes_after_caller_drops_handle() {
+    let ports = Arc::new(Ports(Mutex::new(vec![])));
+    let mut dispatcher =
+        Dispatcher::new(ports.clone(), ports.clone(), ports.clone(), ports.clone());
+    let id = CapabilityId {
+        name: "detached".into(),
+        version: 1,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dispatcher
+        .register(
+            Contract {
+                id: id.clone(),
+                kind: Kind::Operation,
+                input_schema: json!(true),
+                output_schema: json!(true),
+                error_schema: json!(true),
+                event_schema: json!(true),
+                required_capabilities: vec![],
+                confirmation_required: false,
+                support: Support::Supported,
+            },
+            Arc::new(Completion(tokio::sync::Mutex::new(Some(rx)))),
+        )
+        .unwrap();
+    let (_sender, signal) = cancellation();
+    let handle = Arc::new(dispatcher).start(
+        Request {
+            capability: id,
+            identity: "test".into(),
+            input: json!(null),
+            confirmed: false,
+        },
+        signal,
+    );
+    drop(handle);
+    tx.send(()).unwrap();
+    for _ in 0..10 {
+        if !ports.0.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *ports.0.lock().unwrap(),
+        vec![Ok(Outcome::Success(json!(null)))]
+    );
+}
+
 #[tokio::test]
 async fn dropping_a_started_handler_reports_unknown_outcome() {
     let ports = Arc::new(Ports(Mutex::new(vec![])));
