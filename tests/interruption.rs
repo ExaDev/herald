@@ -41,6 +41,14 @@ impl Handler for Completion {
     }
 }
 #[tokio::test]
+async fn explicit_cancellation_reaches_the_receiver() {
+    let (sender, mut signal) = cancellation();
+    sender.send(true).unwrap();
+    signal.cancelled().await;
+    assert!(signal.is_cancelled());
+}
+
+#[tokio::test]
 async fn sender_closure_does_not_signal_cancellation() {
     let (sender, mut signal) = cancellation();
     drop(sender);
