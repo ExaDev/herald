@@ -41,6 +41,14 @@ impl Handler for Completion {
     }
 }
 #[tokio::test]
+async fn sender_closure_does_not_signal_cancellation() {
+    let (sender, mut signal) = cancellation();
+    drop(sender);
+    let mut future = Box::pin(signal.cancelled());
+    tokio::select! { _ = &mut future => panic!("sender closure was treated as cancellation"), _ = tokio::task::yield_now() => {} }
+}
+
+#[tokio::test]
 async fn detached_operation_finishes_after_caller_drops_handle() {
     let ports = Arc::new(Ports(Mutex::new(vec![])));
     let mut dispatcher =
