@@ -19,6 +19,12 @@ impl Confirmer for Policy {
         Box::pin(async move { request.confirmed })
     }
 }
+struct RejectConfirmation;
+impl Confirmer for RejectConfirmation {
+    fn confirm<'a>(&'a self, _: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+}
 struct TestClock;
 impl Clock for TestClock {
     fn now(&self) -> u64 {
@@ -143,6 +149,31 @@ async fn independent_device_and_service_observe_policy_validation_and_unknown_ou
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(audit.0.load(Ordering::SeqCst), 5);
 }
+#[tokio::test]
+async fn caller_claim_cannot_override_product_confirmation_denial() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut dispatcher = Dispatcher::new(
+        Arc::new(Policy),
+        Arc::new(RejectConfirmation),
+        Arc::new(TestClock),
+        Arc::new(Audit::default()),
+    );
+    dispatcher
+        .register(
+            contract("power", 1, true, json!({"type":"object"})),
+            Arc::new(Device(calls.clone())),
+        )
+        .unwrap();
+    let (_sender, signal) = cancellation();
+    assert_eq!(
+        dispatcher
+            .dispatch(request("power", 1, json!({})), signal)
+            .await,
+        Err(DispatchError::ConfirmationRequired)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn schema_versions_accept_their_own_inputs_without_coercion() {
     let mut dispatcher = Dispatcher::new(
