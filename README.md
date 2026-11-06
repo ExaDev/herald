@@ -1,6 +1,6 @@
 # Herald
 
-Herald is a proposed product-neutral framework for declaring application capabilities once and exposing them through multiple interfaces. The repository is at the design stage: the interfaces and implementations described below are goals, not available functionality.
+Herald is a product-neutral framework for declaring application capabilities once and exposing them through multiple interfaces. The in-process Rust registry and dispatcher are under development; remote runtimes and interface adapters described below remain design goals.
 
 ## Purpose
 
