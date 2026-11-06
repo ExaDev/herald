@@ -87,6 +87,8 @@ pub enum DispatchError {
     SubscriptionSource(Value),
     /// The caller dropped an in-flight handler; its side effects are unknown.
     OutcomeLost,
+    /// The request was dropped before the product handler started.
+    InterruptedBeforeDispatch,
 }
 
 /// Cooperative cancellation. A handler decides how cancellation affects its work.
@@ -122,7 +124,7 @@ pub trait Confirmer: Send + Sync {
     fn confirm<'a>(&'a self, request: &'a Request, contract: &'a Contract) -> PortFuture<'a, bool>;
 }
 
-/// Product-provided authorisation, evaluated for every dispatch.
+/// Product-provided authorisation for registered contracts. Adapters must apply exposure policy before forwarding requests or revealing lookup errors; this port alone does not conceal whether an identifier is registered.
 pub trait Authorizer: Send + Sync {
     fn authorize<'a>(
         &'a self,
@@ -146,7 +148,7 @@ pub trait SubscriptionHandler: Send + Sync {
         &'a self,
         request: &'a Request,
         cancellation: Cancellation,
-    ) -> PortFuture<'a, mpsc::Receiver<Result<Value, Value>>>;
+    ) -> PortFuture<'a, Result<mpsc::Receiver<Result<Value, Value>>, Value>>;
 }
 
 /// A subscription validates each event as it is received.
@@ -194,6 +196,7 @@ struct InFlight<'a> {
     clock: &'a dyn Clock,
     request: &'a Request,
     completed: bool,
+    started: bool,
 }
 
 impl Drop for InFlight<'_> {
@@ -202,7 +205,11 @@ impl Drop for InFlight<'_> {
             self.observer.finished(
                 self.request,
                 self.clock.now(),
-                &Err(DispatchError::OutcomeLost),
+                &Err(if self.started {
+                    DispatchError::OutcomeLost
+                } else {
+                    DispatchError::InterruptedBeforeDispatch
+                }),
             );
         }
     }
@@ -213,6 +220,7 @@ struct SubscriptionInFlight<'a> {
     clock: &'a dyn Clock,
     request: &'a Request,
     completed: bool,
+    started: bool,
 }
 impl Drop for SubscriptionInFlight<'_> {
     fn drop(&mut self) {
@@ -220,7 +228,11 @@ impl Drop for SubscriptionInFlight<'_> {
             self.observer.subscription_opened(
                 self.request,
                 self.clock.now(),
-                &Err(DispatchError::OutcomeLost),
+                &Err(if self.started {
+                    DispatchError::OutcomeLost
+                } else {
+                    DispatchError::InterruptedBeforeDispatch
+                }),
             );
         }
     }
@@ -341,7 +353,17 @@ impl Dispatcher {
         request: Request,
         cancellation: Cancellation,
     ) -> Result<Subscription, DispatchError> {
-        let result = self.subscribe_inner(&request, cancellation).await;
+        let mut in_flight = SubscriptionInFlight {
+            observer: self.observer.as_ref(),
+            clock: self.clock.as_ref(),
+            request: &request,
+            completed: false,
+            started: false,
+        };
+        let result = self
+            .subscribe_inner(&request, cancellation, &mut in_flight)
+            .await;
+        in_flight.completed = true;
         let audit = result.as_ref().map(|_| ()).map_err(Clone::clone);
         self.observer
             .subscription_opened(&request, self.clock.now(), &audit);
@@ -352,18 +374,19 @@ impl Dispatcher {
         &self,
         request: &Request,
         cancellation: Cancellation,
+        in_flight: &mut SubscriptionInFlight<'_>,
     ) -> Result<Subscription, DispatchError> {
         let entry = self
             .entries
             .get(&request.capability)
             .ok_or(DispatchError::NotFound)?;
+        if !self.authorizer.authorize(request, &entry.contract).await {
+            return Err(DispatchError::Denied);
+        }
         let handler = entry
             .subscription
             .as_ref()
             .ok_or(DispatchError::WrongCapabilityKind)?;
-        if !self.authorizer.authorize(request, &entry.contract).await {
-            return Err(DispatchError::Denied);
-        }
         match entry.contract.support {
             Support::Supported => {}
             Support::Unsupported => return Err(DispatchError::Unsupported),
@@ -381,14 +404,18 @@ impl Dispatcher {
         if cancellation.is_cancelled() {
             return Err(DispatchError::CancelledBeforeDispatch);
         }
-        let mut in_flight = SubscriptionInFlight {
-            observer: self.observer.as_ref(),
-            clock: self.clock.as_ref(),
-            request,
-            completed: false,
+        in_flight.started = true;
+        let result = handler.subscribe(request, cancellation).await;
+        let receiver = match result {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                entry
+                    .error
+                    .validate(&error)
+                    .map_err(|e| DispatchError::InvalidError(e.to_string()))?;
+                return Err(DispatchError::SubscriptionSource(error));
+            }
         };
-        let receiver = handler.subscribe(request, cancellation).await;
-        in_flight.completed = true;
         Ok(Subscription {
             receiver,
             validator: entry.event.clone(),
@@ -412,7 +439,17 @@ impl Dispatcher {
         request: Request,
         cancellation: Cancellation,
     ) -> Result<Outcome, DispatchError> {
-        let result = self.dispatch_inner(&request, cancellation).await;
+        let mut in_flight = InFlight {
+            observer: self.observer.as_ref(),
+            clock: self.clock.as_ref(),
+            request: &request,
+            completed: false,
+            started: false,
+        };
+        let result = self
+            .dispatch_inner(&request, cancellation, &mut in_flight)
+            .await;
+        in_flight.completed = true;
         self.observer.finished(&request, self.clock.now(), &result);
         result
     }
@@ -421,6 +458,7 @@ impl Dispatcher {
         &self,
         request: &Request,
         cancellation: Cancellation,
+        in_flight: &mut InFlight<'_>,
     ) -> Result<Outcome, DispatchError> {
         let entry = self
             .entries
@@ -450,14 +488,8 @@ impl Dispatcher {
             .handler
             .as_ref()
             .ok_or(DispatchError::WrongCapabilityKind)?;
-        let mut in_flight = InFlight {
-            observer: self.observer.as_ref(),
-            clock: self.clock.as_ref(),
-            request,
-            completed: false,
-        };
+        in_flight.started = true;
         let outcome = handler.invoke(request, cancellation).await;
-        in_flight.completed = true;
         match &outcome {
             Outcome::Success(value) => entry
                 .output

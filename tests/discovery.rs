@@ -36,15 +36,20 @@ impl SubscriptionHandler for Ports {
         &'a self,
         _: &'a Request,
         _: Cancellation,
-    ) -> PortFuture<'a, tokio::sync::mpsc::Receiver<Result<serde_json::Value, serde_json::Value>>>
-    {
+    ) -> PortFuture<
+        'a,
+        Result<
+            tokio::sync::mpsc::Receiver<Result<serde_json::Value, serde_json::Value>>,
+            serde_json::Value,
+        >,
+    > {
         Box::pin(async {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tx.send(Ok(json!(1))).await.unwrap();
             tx.send(Ok(json!("bad"))).await.unwrap();
             tx.send(Err(json!({"reason":"failed"}))).await.unwrap();
             tx.send(Err(json!("invalid"))).await.unwrap();
-            rx
+            Ok(rx)
         })
     }
 }
