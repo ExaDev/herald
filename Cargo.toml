@@ -13,4 +13,11 @@ tokio = { version = "1.54.1", features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
+axum = "0.8"
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
 kvm-core = { git = "https://github.com/Mearman/kvm-control", rev = "68034b4b9ebc41adc2cd2ab064895fb3473a4289" }
+kvm-kvmd = { git = "https://github.com/Mearman/kvm-control", rev = "68034b4b9ebc41adc2cd2ab064895fb3473a4289" }
+rcgen = "0.13"
+tokio = { version = "1.54.1", features = ["net", "time", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+url = "2.5.8"
