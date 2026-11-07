@@ -924,3 +924,34 @@ async fn a_failed_recovery_releases_the_store_claim() {
         "a failed open must not leave the store claimed"
     );
 }
+
+#[tokio::test]
+async fn shutdown_stops_a_handler_that_never_completes_and_frees_the_store() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let runtime = open(&dispatcher(&ports, &calls, true), &store).await;
+    let mut caller = Box::pin(runtime.submit(request("a", json!({})), "k".into(), live()));
+    while calls.load(Ordering::SeqCst) == 0 {
+        tokio::select! { _ = &mut caller => panic!("stalls"), _ = tokio::task::yield_now() => {} }
+    }
+    drop(caller);
+    runtime.shutdown().await;
+    let (reopened, interrupted) = Runtime::open(dispatcher(&ports, &calls, false), store.clone())
+        .await
+        .expect("the store is free once the runtime has shut down");
+    assert_eq!(interrupted.len(), 1);
+    let retry = reopened
+        .submit(request("a", json!({})), "k".into(), live())
+        .await;
+    match retry.result {
+        Ok(Outcome::Unknown(v)) => {
+            assert_eq!(v["source"], "runtime");
+            assert_eq!(v["state"], "interrupted");
+        }
+        other => panic!("expected the runtime's unknown outcome, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
