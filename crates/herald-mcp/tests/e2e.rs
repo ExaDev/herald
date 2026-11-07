@@ -278,87 +278,154 @@ async fn both_transports_expose_the_same_tools_with_the_same_schemas() {
 
 #[tokio::test]
 async fn the_same_calls_give_the_same_results_over_both_transports() {
+    /// What a row must produce, so equality between the transports cannot be two identical mistakes.
+    enum Expect {
+        /// A result with an outcome or a start state, not flagged as an error.
+        Result,
+        /// A result whose operation reported an error outcome: flagged, with `failed`.
+        Failed,
+        /// A typed error with this code.
+        Code(&'static str),
+    }
+    use Expect::{Code, Failed, Result as Ok_};
     let world = world().await;
     let stdio = stdio_client(&world, "alice").await;
     let network = network_client(&world, "alice-token").await;
-    for (tool, arguments) in [
-        ("read.v1", json!({"x": 1})),
-        ("read.v1", json!({"x": "not an integer"})),
+    let rows: Vec<(&str, Value, Expect)> = vec![
+        ("read.v1", json!({"x": 1}), Ok_),
         (
-            "write.v1",
-            json!({"idempotency_key": "k1", "input": {"x": 1}}),
+            "read.v1",
+            json!({"x": "not an integer"}),
+            Code("invalid_input"),
         ),
         (
             "write.v1",
             json!({"idempotency_key": "k1", "input": {"x": 1}}),
+            Ok_,
+        ),
+        (
+            "write.v1",
+            json!({"idempotency_key": "k1", "input": {"x": 1}}),
+            Ok_,
         ),
         (
             "write.v1",
             json!({"idempotency_key": "k1", "input": {"x": 2}}),
+            Code("key_conflict"),
         ),
-        ("write.v1", json!({"input": {"x": 1}})),
+        ("write.v1", json!({"input": {"x": 1}}), Code("bad_request")),
         (
             "write.v1",
             json!({"idempotency_key": "k2", "input": {"x": "bad"}}),
+            Code("invalid_input"),
         ),
-        ("nothing.v1", json!({})),
-        ("read", json!({})),
-        ("read.v01", json!({"x": 1})),
-        ("read.v+1", json!({"x": 1})),
+        ("nothing.v1", json!({}), Code("not_found")),
+        ("read", json!({}), Code("not_found")),
+        ("read.v01", json!({"x": 1}), Code("not_found")),
+        ("read.v+1", json!({"x": 1}), Code("not_found")),
         (
             "fails.v1",
             json!({"idempotency_key": "f1", "input": {"x": 1}}),
+            Failed,
         ),
         (
             "doubts.v1",
             json!({"idempotency_key": "d1", "input": {"x": 1}}),
+            Ok_,
         ),
         (
             "write.v1",
             json!({"idempotency_key": "k3", "input": {}, "detach": "yes"}),
+            Code("bad_request"),
         ),
         (
             "write.v1",
             json!({"idempotency_key": "k3", "input": {}, "extra": 1}),
+            Code("bad_request"),
         ),
-    ] {
+        // Start and detach: running, the same key started again, a synchronous retry of the running
+        // key, a completed key started again (a finished start), and a failed one.
+        (
+            "slow.v1",
+            json!({"idempotency_key": "s1", "input": {}, "detach": true}),
+            Ok_,
+        ),
+        (
+            "slow.v1",
+            json!({"idempotency_key": "s1", "input": {}, "detach": true}),
+            Ok_,
+        ),
+        (
+            "slow.v1",
+            json!({"idempotency_key": "s1", "input": {}}),
+            Code("in_progress"),
+        ),
+        (
+            "write.v1",
+            json!({"idempotency_key": "k1", "input": {"x": 1}, "detach": true}),
+            Ok_,
+        ),
+        (
+            "fails.v1",
+            json!({"idempotency_key": "f1", "input": {"x": 1}, "detach": true}),
+            Failed,
+        ),
+        // Over the input bound but inside the request bound: judged after authorisation.
+        (
+            "write.v1",
+            json!({"idempotency_key": "big", "input": {"blob": "x".repeat(herald::service::MAX_INPUT_BYTES)}}),
+            Code("too_large"),
+        ),
+    ];
+    for (tool, arguments, expect) in rows {
         let a = call(&stdio, tool, arguments.clone()).await;
         let b = call(&network, tool, arguments.clone()).await;
         assert_eq!(is_error(&a), is_error(&b), "{tool} {arguments}");
         assert_eq!(structured(&a), structured(&b), "{tool} {arguments}");
+        match expect {
+            Ok_ => {
+                assert!(!is_error(&a), "{tool} {arguments}: {}", structured(&a));
+                let body = structured(&a);
+                assert!(
+                    body.get("outcome").is_some() || body.get("state").is_some(),
+                    "{tool} {arguments}: {body}"
+                );
+            }
+            Failed => {
+                assert!(is_error(&a), "{tool} {arguments}");
+                assert_eq!(structured(&a)["failed"], true, "{tool} {arguments}");
+            }
+            Code(code) => {
+                assert!(is_error(&a), "{tool} {arguments}");
+                assert_eq!(error_code(&a), code, "{tool} {arguments}");
+            }
+        }
     }
-    // Spot-check the actual outcomes, so equality cannot be two identical failures.
-    let ok = call(&stdio, "read.v1", json!({"x": 1})).await;
-    assert!(!is_error(&ok));
-    assert_eq!(structured(&ok)["outcome"]["Success"]["caller"], "alice");
-    assert_eq!(
-        error_code(&call(&stdio, "read.v1", json!({"x": "no"})).await),
-        "invalid_input"
+    // The started operation is one operation, and a finished start says so.
+    let finished = structured(
+        &call(
+            &stdio,
+            "write.v1",
+            json!({"idempotency_key": "k1", "input": {"x": 1}, "detach": true}),
+        )
+        .await,
     );
-    assert_eq!(
-        error_code(
-            &call(
-                &stdio,
-                "write.v1",
-                json!({"idempotency_key": "k1", "input": {"x": 2}})
-            )
-            .await
-        ),
-        "key_conflict"
+    assert_eq!(finished["state"], "finished");
+    let running = structured(
+        &call(
+            &stdio,
+            "slow.v1",
+            json!({"idempotency_key": "s1", "input": {}, "detach": true}),
+        )
+        .await,
     );
-    assert_eq!(
-        error_code(&call(&stdio, "write.v1", json!({"input": {"x": 1}})).await),
-        "bad_request"
-    );
-    assert_eq!(
-        error_code(&call(&stdio, "nothing.v1", json!({})).await),
-        "not_found"
-    );
-    // Handler runs: three successful reads (stdio, network and the spot check above), the write for
-    // `k1` exactly once though it was delivered three times over two transports, and `f1` and `d1`
-    // once each, though each went over both transports. Nothing else ran: the invalid, conflicting,
-    // keyless, unknown and mis-shaped calls never reached a handler.
-    assert_eq!(world.calls.load(Ordering::SeqCst), 3 + 1 + 1 + 1);
+    assert_eq!(running["state"], "running");
+    // Handler runs: reads are not counted by key, so count them: stdio and network ran `read` once
+    // each. The write for `k1` ran once though it was delivered over both transports and again
+    // detached. `f1`, `d1` and `s1` ran once each. Nothing else ran: the invalid, conflicting,
+    // keyless, unknown, mis-shaped and oversized calls never reached a handler.
+    assert_eq!(world.calls.load(Ordering::SeqCst), 2 + 1 + 1 + 1 + 1);
+    world.release.notify_one();
 }
 
 #[tokio::test]
@@ -473,16 +540,23 @@ async fn a_retry_of_a_running_key_is_in_progress_not_a_lost_outcome() {
 }
 
 #[tokio::test]
-async fn malformed_follow_arguments_are_protocol_errors_not_tool_results() {
+async fn unreadable_follow_arguments_are_typed_results_a_model_can_read_on_both_transports() {
     let world = world().await;
-    let client = stdio_client(&world, "alice").await;
-    let result = client
-        .call_tool(
-            CallToolRequestParams::new(OPERATION_TOOL.to_string())
-                .with_arguments(args(json!({"id": 7}))),
-        )
-        .await;
-    assert!(result.is_err(), "a non-string id is a malformed request");
+    for client in [
+        stdio_client(&world, "alice").await,
+        network_client(&world, "alice-token").await,
+    ] {
+        for (tool, arguments) in [
+            (OPERATION_TOOL, json!({"id": 7})),
+            (OPERATION_TOOL, json!({})),
+            (EVENTS_TOOL, json!({"id": "op-x", "cursor": -1})),
+            (EVENTS_TOOL, json!({"id": "op-x", "cursor": "0"})),
+        ] {
+            let result = call(&client, tool, arguments.clone()).await;
+            assert!(is_error(&result), "{tool} {arguments}");
+            assert_eq!(error_code(&result), "bad_request", "{tool} {arguments}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -595,12 +669,8 @@ async fn events_are_read_from_the_cursor_given() {
         json!({"id": operation, "cursor": -1}),
         json!({"id": operation, "cursor": "0"}),
     ] {
-        let result = client
-            .call_tool(
-                CallToolRequestParams::new(EVENTS_TOOL.to_string()).with_arguments(args(bad)),
-            )
-            .await;
-        assert!(result.is_err(), "a malformed cursor is a protocol error");
+        let result = call(&client, EVENTS_TOOL, bad).await;
+        assert_eq!(error_code(&result), "bad_request");
     }
 }
 
@@ -694,6 +764,16 @@ async fn the_unguarded_routes_refuse_every_call_because_no_boundary_named_a_call
     let config = StreamableHttpClientTransportConfig::with_uri(url);
     let client = ().serve(StreamableHttpClientTransport::from_config(config)).await;
     let client = client.expect("the SDK admits a host in its list; the handler refuses the call");
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("read.v1".to_string()).with_arguments(args(json!({"x": 1}))),
+        )
+        .await
+        .expect_err("no boundary named a caller");
+    assert!(
+        refused.to_string().contains("authentication is required"),
+        "refused for the missing caller: {refused}"
+    );
     assert!(client.list_all_tools().await.is_err());
     assert_eq!(world.calls.load(Ordering::SeqCst), 0);
 }
@@ -781,32 +861,26 @@ async fn a_network_call_the_client_abandons_cancels_the_handler_and_a_detached_s
             .json(&body)
             .send()
     };
-    let impatient = reqwest::Client::builder()
-        .timeout(Duration::from_millis(300))
-        .build()
-        .unwrap();
-    let abandoned = post(
-        &impatient,
-        rpc(
-            1,
-            "slow.v1",
-            json!({"idempotency_key": "abandon", "input": {}}),
-        ),
-    )
-    .await;
-    assert!(abandoned.is_err(), "the client gave up");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while world.cancelled.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the handler was told the caller went away");
+    let client = reqwest::Client::new();
+    let abandoning = {
+        let request = post(
+            &client,
+            rpc(
+                1,
+                "slow.v1",
+                json!({"idempotency_key": "abandon", "input": {}}),
+            ),
+        );
+        tokio::spawn(request)
+    };
+    // Abort only once the handler is running, so what follows is the abandonment and not a request
+    // that never arrived.
+    wait_until(|| world.calls.load(Ordering::SeqCst) == 1).await;
+    abandoning.abort();
+    wait_until(|| world.cancelled.load(Ordering::SeqCst) == 1).await;
 
-    let before = world.cancelled.load(Ordering::SeqCst);
-    let patient = reqwest::Client::new();
     let started = post(
-        &patient,
+        &client,
         rpc(
             2,
             "slow.v1",
@@ -816,14 +890,159 @@ async fn a_network_call_the_client_abandons_cancels_the_handler_and_a_detached_s
     .await
     .unwrap();
     assert_eq!(started.status().as_u16(), 200);
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    let started: Value = started.json().await.unwrap();
+    let operation = started["result"]["structuredContent"]["operation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The start request has ended. The operation is still running, not cancelled: releasing it
+    // completes it, and nothing was told to stop.
+    wait_until(|| world.calls.load(Ordering::SeqCst) == 2).await;
     world.release.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        world.cancelled.load(Ordering::SeqCst),
-        before,
-        "ending the start request did not cancel the detached operation"
+    let network = network_client(&world, "alice-token").await;
+    wait_for_events(&network, &operation, 2).await;
+    assert_eq!(world.cancelled.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_stdio_call_the_client_cancels_is_cancelled_by_the_protocol() {
+    use rmcp::model::{CallToolRequest, ClientRequest};
+    use rmcp::service::PeerRequestOptions;
+    let world = world().await;
+    let client = stdio_client(&world, "alice").await;
+    let params = CallToolRequestParams::new("slow.v1".to_string())
+        .with_arguments(args(json!({"idempotency_key": "c", "input": {}})));
+    let handle = client
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    wait_until(|| world.calls.load(Ordering::SeqCst) == 1).await;
+    handle.cancel(Some("test".into())).await.unwrap();
+    wait_until(|| world.cancelled.load(Ordering::SeqCst) == 1).await;
+}
+
+/// Polls `condition` until it holds, giving up after a generous bound so a failure reports instead of
+/// hanging. The bound is only a backstop: every caller waits on an event another task will cause.
+async fn wait_until(condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the awaited event happened");
+}
+
+/// Reads `operation`'s events over `client` until there are `count` of them.
+async fn wait_for_events(client: &Client, operation: &str, count: usize) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let events = call(client, EVENTS_TOOL, json!({"id": operation})).await;
+            if structured(&events)["events"].as_array().unwrap().len() >= count {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the operation reached the awaited state");
+}
+
+#[tokio::test]
+async fn every_result_a_tool_returns_validates_against_the_output_schema_it_declared() {
+    let world = world().await;
+    let listed = network_client(&world, "alice-token")
+        .await
+        .list_all_tools()
+        .await
+        .unwrap();
+    let schema_of = |name: &str| {
+        let tool = listed.iter().find(|t| t.name == name).unwrap();
+        let schema =
+            Value::Object((**tool.output_schema.as_ref().expect("an output schema")).clone());
+        jsonschema::validator_for(&schema).expect("a valid schema")
+    };
+    let follow = listed.iter().find(|t| t.name == OPERATION_TOOL).unwrap();
+    assert!(follow.output_schema.is_none(), "follow tools declare none");
+    for client in [
+        stdio_client(&world, "alice").await,
+        network_client(&world, "alice-token").await,
+    ] {
+        for (tool, arguments) in [
+            ("read.v1", json!({"x": 1})),
+            ("read.v1", json!({"x": "bad"})),
+            (
+                "write.v1",
+                json!({"idempotency_key": "w", "input": {"x": 1}}),
+            ),
+            (
+                "write.v1",
+                json!({"idempotency_key": "w", "input": {"x": 1}, "detach": true}),
+            ),
+            (
+                "write.v1",
+                json!({"idempotency_key": "w", "input": {"x": 2}}),
+            ),
+            ("fails.v1", json!({"idempotency_key": "f", "input": {}})),
+            ("doubts.v1", json!({"idempotency_key": "d", "input": {}})),
+            (
+                "slow.v1",
+                json!({"idempotency_key": "s", "input": {}, "detach": true}),
+            ),
+        ] {
+            let result = structured(&call(&client, tool, arguments.clone()).await);
+            assert!(
+                schema_of(tool).is_valid(&result),
+                "{tool} {arguments} returned {result}"
+            );
+        }
+    }
+    // A result the schema was never meant to admit is refused.
+    assert!(!schema_of("read.v1").is_valid(&json!({"outcome": 3})));
+    world.release.notify_one();
+}
+
+#[test]
+fn definitions_in_input_output_and_error_schemas_resolve_in_the_published_tool_schemas() {
+    let descriptor = herald::service::Descriptor {
+        id: id("shape"),
+        kind: Kind::Operation,
+        input_schema: json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/definitions/A"}, "again": {"$ref": "#/properties/a"}},
+            "definitions": {"A": {"type": "object", "properties": {"b": {"$ref": "#/definitions/B"}}},
+                            "B": {"type": "integer"}}
+        }),
+        output_schema: json!({
+            "type": "object", "properties": {"n": {"$ref": "#/$defs/N"}, "me": {"$ref": "#"}},
+            "$defs": {"N": {"type": "integer"}}
+        }),
+        error_schema: json!({
+            "type": "object", "properties": {"why": {"$ref": "#/$defs/N"}},
+            "$defs": {"N": {"type": "string"}}
+        }),
+        confirmation_required: false,
+        support: Support::Supported,
+    };
+    let input = herald_mcp::tool_input_schema(&descriptor);
+    let input = jsonschema::validator_for(&input).expect("input schema is valid");
+    assert!(
+        input.is_valid(
+            &json!({"idempotency_key": "k", "input": {"a": {"b": 1}, "again": {"b": 2}}})
+        )
     );
+    assert!(!input.is_valid(&json!({"idempotency_key": "k", "input": {"a": {"b": "x"}}})));
+
+    let output = herald_mcp::tool_output_schema(&descriptor);
+    let output = jsonschema::validator_for(&output).expect("output schema is valid");
+    let success = |body: Value| json!({"operation": "op-1", "outcome": {"Success": body}});
+    assert!(output.is_valid(&success(json!({"n": 1, "me": {"n": 2}}))));
+    assert!(!output.is_valid(&success(json!({"n": "x"}))));
+    // The two capabilities' `N` definitions do not collide: the error's is a string.
+    assert!(output.is_valid(&json!({"operation": "op-1", "outcome": {"Error": {"why": "text"}}})));
+    assert!(!output.is_valid(&json!({"operation": "op-1", "outcome": {"Error": {"why": 3}}})));
 }

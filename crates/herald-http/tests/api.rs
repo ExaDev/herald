@@ -137,6 +137,7 @@ async fn world() -> World {
         ("read", Kind::Query, false, Behaviour::Succeed),
         ("write", Kind::Operation, false, Behaviour::Succeed),
         ("slow", Kind::Operation, true, Behaviour::Succeed),
+        ("hang", Kind::Query, true, Behaviour::Succeed),
         ("fails", Kind::Operation, false, Behaviour::Fail),
         ("doubts", Kind::Operation, false, Behaviour::Doubt),
     ] {
@@ -156,7 +157,7 @@ async fn world() -> World {
         .await
         .unwrap();
     // Exposed on both surfaces, so parity can be checked against the MCP adapter.
-    let exposure = ["read", "write", "slow", "fails", "doubts"]
+    let exposure = ["read", "write", "slow", "hang", "fails", "doubts"]
         .into_iter()
         .fold(Exposure::none(), |e, n| {
             e.allow(Surface::Api, id(n)).allow(Surface::Mcp, id(n))
@@ -182,6 +183,30 @@ async fn world() -> World {
         client: Client::new(),
         _server: server,
     }
+}
+
+async fn mcp_client(
+    w: &World,
+    identity: &str,
+) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let handler = HeraldMcp::stdio(w.service.clone(), Principal::new(identity).unwrap());
+    tokio::spawn(async move {
+        let _ = handler.serve(server_io).await.unwrap().waiting().await;
+    });
+    ().serve(client_io).await.unwrap()
+}
+
+/// Polls `condition` until it holds. The bound is a backstop so a failure reports instead of hanging;
+/// every caller waits on an event another task will cause.
+async fn wait_until(condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the awaited event happened");
 }
 
 struct Reply {
@@ -721,87 +746,288 @@ async fn the_boundary_covers_routes_that_do_not_exist_and_marks_every_answer_unc
     assert!(r.text().await.unwrap().contains("not_found"));
 }
 
+/// How a parity row runs: a call to completion, or a start (a detached call over MCP).
+#[derive(Clone, Copy, PartialEq)]
+enum Route {
+    Call,
+    Start,
+}
+
 #[tokio::test]
 async fn http_and_mcp_give_the_same_answer_for_the_same_request() {
     let w = world().await;
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let handler = HeraldMcp::stdio(w.service.clone(), Principal::new("alice").unwrap());
-    tokio::spawn(async move {
-        let _ = handler.serve(server_io).await.unwrap().waiting().await;
-    });
-    let mcp = ().serve(client_io).await.unwrap();
+    let mcp = mcp_client(&w, "alice").await;
+    let mallory = mcp_client(&w, "mallory").await;
     let huge_key = "k".repeat(300);
-    // (capability, input, idempotency key). MCP runs each first, so HTTP replays the operations.
-    let rows: Vec<(&str, Value, Option<&str>)> = vec![
-        ("read", json!({"x": 1}), None),
-        ("read", json!({"x": "bad"}), None),
-        ("write", json!({"x": 1}), Some("p1")),
-        ("write", json!({"x": 2}), Some("p1")),
-        ("write", json!({"x": 1}), None),
-        ("write", json!({"x": "bad"}), Some("p2")),
-        ("fails", json!({}), Some("p3")),
-        ("doubts", json!({}), Some("p4")),
-        ("nothing", json!({}), Some("p5")),
-        ("write", json!({}), Some(huge_key.as_str())),
+    let blob = "x".repeat(herald::service::MAX_INPUT_BYTES);
+    // (capability, input, key, route, caller, expected HTTP status, expected error code or `None`
+    // for a result). The expectations are stated, so a bug both adapters share is still caught.
+    type Row<'a> = (
+        &'a str,
+        Value,
+        Option<&'a str>,
+        Route,
+        &'a str,
+        u16,
+        Option<&'a str>,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            "read",
+            json!({"x": 1}),
+            None,
+            Route::Call,
+            "alice",
+            200,
+            None,
+        ),
+        (
+            "read",
+            json!({"x": "bad"}),
+            None,
+            Route::Call,
+            "alice",
+            422,
+            Some("invalid_input"),
+        ),
+        (
+            "write",
+            json!({"x": 1}),
+            Some("p1"),
+            Route::Call,
+            "alice",
+            200,
+            None,
+        ),
+        (
+            "write",
+            json!({"x": 2}),
+            Some("p1"),
+            Route::Call,
+            "alice",
+            409,
+            Some("key_conflict"),
+        ),
+        (
+            "write",
+            json!({"x": 1}),
+            None,
+            Route::Call,
+            "alice",
+            400,
+            Some("bad_request"),
+        ),
+        (
+            "write",
+            json!({"x": "bad"}),
+            Some("p2"),
+            Route::Call,
+            "alice",
+            422,
+            Some("invalid_input"),
+        ),
+        (
+            "fails",
+            json!({}),
+            Some("p3"),
+            Route::Call,
+            "alice",
+            200,
+            None,
+        ),
+        (
+            "doubts",
+            json!({}),
+            Some("p4"),
+            Route::Call,
+            "alice",
+            200,
+            None,
+        ),
+        (
+            "nothing",
+            json!({}),
+            Some("p5"),
+            Route::Call,
+            "alice",
+            404,
+            Some("not_found"),
+        ),
+        (
+            "write",
+            json!({}),
+            Some(huge_key.as_str()),
+            Route::Call,
+            "alice",
+            413,
+            Some("too_large"),
+        ),
+        (
+            "write",
+            json!({"blob": blob}),
+            Some("p6"),
+            Route::Call,
+            "alice",
+            413,
+            Some("too_large"),
+        ),
+        // Start: running, the same key again, a synchronous retry of the running key, a completed key
+        // started again (a finished start), and a denied caller.
+        (
+            "slow",
+            json!({}),
+            Some("p7"),
+            Route::Start,
+            "alice",
+            202,
+            None,
+        ),
+        (
+            "slow",
+            json!({}),
+            Some("p7"),
+            Route::Start,
+            "alice",
+            202,
+            None,
+        ),
+        (
+            "slow",
+            json!({}),
+            Some("p7"),
+            Route::Call,
+            "alice",
+            409,
+            Some("in_progress"),
+        ),
+        (
+            "write",
+            json!({"x": 1}),
+            Some("p1"),
+            Route::Start,
+            "alice",
+            200,
+            None,
+        ),
+        (
+            "fails",
+            json!({}),
+            Some("p3"),
+            Route::Start,
+            "alice",
+            200,
+            None,
+        ),
+        (
+            "write",
+            json!({"x": 1}),
+            Some("p8"),
+            Route::Call,
+            "mallory",
+            404,
+            Some("not_found"),
+        ),
+        (
+            "slow",
+            json!({}),
+            Some("p9"),
+            Route::Start,
+            "mallory",
+            404,
+            Some("not_found"),
+        ),
     ];
-    for (name, input, key) in rows {
-        let arguments = match (name, key) {
-            ("read", _) => input.clone(),
-            (_, Some(key)) => json!({"input": input, "idempotency_key": key}),
-            (_, None) => json!({"input": input}),
+    for (name, input, key, route, caller, status, code) in rows {
+        let caller_mcp = if caller == "alice" { &mcp } else { &mallory };
+        let mut arguments = if name == "read" {
+            input.clone()
+        } else {
+            json!({"input": input})
         };
-        let over_mcp = mcp
+        let mut body = json!({"input": input});
+        if let Some(key) = key {
+            arguments["idempotency_key"] = json!(key);
+            body["idempotency_key"] = json!(key);
+        }
+        if route == Route::Start {
+            arguments["detach"] = json!(true);
+        }
+        let over_mcp = caller_mcp
             .call_tool(
                 CallToolRequestParams::new(format!("{name}.v1"))
                     .with_arguments(arguments.as_object().cloned().unwrap()),
             )
             .await
             .unwrap();
-        let body = match key {
-            Some(key) => json!({"input": input, "idempotency_key": key}),
-            None => json!({"input": input}),
+        let verb = if route == Route::Start {
+            "start"
+        } else {
+            "call"
         };
         let over_http = w
-            .post("alice-token", &format!("/capabilities/{name}/1/call"), body)
+            .post(
+                &format!("{caller}-token"),
+                &format!("/capabilities/{name}/1/{verb}"),
+                body,
+            )
             .await;
+        let label = format!("{name} {input} {key:?} {verb} {caller}");
+        assert_eq!(over_http.status.as_u16(), status, "{label}");
         assert_eq!(
             over_http.body,
             over_mcp.structured_content.clone().unwrap(),
-            "{name} {input} {key:?}"
+            "{label}"
         );
-        // The failure signals agree too: a typed error or an error outcome is a tool error on MCP.
-        let http_failed = over_http.status != StatusCode::OK || over_http.body["failed"] == true;
-        assert_eq!(
-            over_mcp.is_error == Some(true),
-            http_failed,
-            "{name} {input}"
-        );
+        match code {
+            Some(code) => assert_eq!(over_http.body["error"]["code"], code, "{label}"),
+            None => assert!(over_http.body.get("error").is_none(), "{label}"),
+        }
+        // The failure signals agree: a typed error or an error outcome is a tool error on MCP.
+        let http_failed = over_http.status.as_u16() >= 400 || over_http.body["failed"] == true;
+        assert_eq!(over_mcp.is_error == Some(true), http_failed, "{label}");
     }
+    // The finished start is tagged, the running one too, and the failed one carries its flag.
+    let finished = w
+        .post(
+            "alice-token",
+            "/capabilities/write/1/start",
+            json!({"input": {"x": 1}, "idempotency_key": "p1"}),
+        )
+        .await;
+    assert_eq!(finished.body["state"], "finished");
+    let failed = w
+        .post(
+            "alice-token",
+            "/capabilities/fails/1/start",
+            json!({"input": {}, "idempotency_key": "p3"}),
+        )
+        .await;
+    assert_eq!(
+        (
+            failed.body["state"].as_str(),
+            failed.body["failed"].as_bool()
+        ),
+        (Some("finished"), Some(true))
+    );
+    w.release.notify_one();
 }
 
 #[tokio::test]
 async fn a_call_the_client_abandons_is_cancelled_and_a_started_operation_is_not() {
     let w = world().await;
-    let impatient = Client::builder()
-        .timeout(Duration::from_millis(300))
-        .build()
-        .unwrap();
-    let abandoned = impatient
-        .post(format!("{}/capabilities/slow/1/call", w.base))
-        .header("authorization", "Bearer alice-token")
-        .json(&json!({"input": {}, "idempotency_key": "abandon"}))
-        .send()
-        .await;
-    assert!(abandoned.is_err(), "the client gave up");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while w.cancelled.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the handler was told the caller went away");
+    let abandoning = tokio::spawn(
+        Client::new()
+            .post(format!("{}/capabilities/slow/1/call", w.base))
+            .header("authorization", "Bearer alice-token")
+            .json(&json!({"input": {}, "idempotency_key": "abandon"}))
+            .send(),
+    );
+    // Abort only once the handler is running, so what follows is the abandonment and not a request
+    // that never arrived.
+    wait_until(|| w.calls.load(Ordering::SeqCst) == 1).await;
+    abandoning.abort();
+    wait_until(|| w.cancelled.load(Ordering::SeqCst) == 1).await;
 
-    let before = w.cancelled.load(Ordering::SeqCst);
     let started = w
         .post(
             "alice-token",
@@ -810,13 +1036,11 @@ async fn a_call_the_client_abandons_is_cancelled_and_a_started_operation_is_not(
         )
         .await;
     assert_eq!(started.status, StatusCode::ACCEPTED);
-    // The start request has ended; give a wrongly wired cancellation time to fire.
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    // The start request has ended and the handler is running, uncancelled.
+    wait_until(|| w.calls.load(Ordering::SeqCst) == 2).await;
     w.release.notify_one();
     let operation = started.body["operation"].as_str().unwrap().to_owned();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let view = w
                 .get("alice-token", &format!("/operations/{operation}"))
@@ -829,7 +1053,22 @@ async fn a_call_the_client_abandons_is_cancelled_and_a_started_operation_is_not(
     })
     .await
     .expect("the detached operation completed");
-    assert_eq!(w.cancelled.load(Ordering::SeqCst), before);
+    assert_eq!(w.cancelled.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_abandoned_query_is_told_to_stop_too() {
+    let w = world().await;
+    let abandoning = tokio::spawn(
+        Client::new()
+            .post(format!("{}/capabilities/hang/1/call", w.base))
+            .header("authorization", "Bearer alice-token")
+            .json(&json!({"input": {}}))
+            .send(),
+    );
+    wait_until(|| w.calls.load(Ordering::SeqCst) == 1).await;
+    abandoning.abort();
+    wait_until(|| w.cancelled.load(Ordering::SeqCst) == 1).await;
 }
 
 #[test]
@@ -914,4 +1153,266 @@ fn components_do_not_collide_when_names_differ_only_in_punctuation() {
             "a pointer to the schema's own root points at its component"
         );
     }
+}
+
+#[tokio::test]
+async fn an_operation_started_over_http_is_followed_over_mcp_and_the_two_agree() {
+    let w = world().await;
+    let mcp = mcp_client(&w, "alice").await;
+    let started = w
+        .post(
+            "alice-token",
+            "/capabilities/slow/1/start",
+            json!({"input": {}, "idempotency_key": "x"}),
+        )
+        .await;
+    assert_eq!(started.status, StatusCode::ACCEPTED);
+    let operation = started.body["operation"].as_str().unwrap().to_owned();
+    let follow = |tool: &'static str, arguments: Value| {
+        let mcp = &mcp;
+        async move {
+            mcp.call_tool(
+                CallToolRequestParams::new(tool.to_string())
+                    .with_arguments(arguments.as_object().cloned().unwrap()),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let over_mcp = follow(herald_mcp::OPERATION_TOOL, json!({"id": operation})).await;
+    let over_http = w
+        .get("alice-token", &format!("/operations/{operation}"))
+        .await;
+    assert_eq!(over_mcp.structured_content.unwrap(), over_http.body);
+    w.release.notify_one();
+    wait_until(|| w.calls.load(Ordering::SeqCst) == 1).await;
+    let done = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let events = follow(
+                herald_mcp::EVENTS_TOOL,
+                json!({"id": operation, "cursor": 1}),
+            )
+            .await;
+            let events = events.structured_content.unwrap();
+            if !events["events"].as_array().unwrap().is_empty() {
+                return events;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed");
+    let over_http = w
+        .get(
+            "alice-token",
+            &format!("/operations/{operation}/events?cursor=1"),
+        )
+        .await;
+    assert_eq!(done, over_http.body);
+}
+
+#[tokio::test]
+async fn both_adapters_served_from_one_guarded_router_share_one_boundary() {
+    let w = world().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let policy = OriginPolicy::new([address.to_string()], [ORIGIN.to_string()]).unwrap();
+    let boundary = Boundary::new(Arc::new(Tokens), policy, limits());
+    let app = herald_http::router(w.service.clone(), boundary.clone())
+        .merge(herald_mcp::router(w.service.clone(), boundary));
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let client = Client::new();
+    let base = format!("http://{address}");
+    // Every path is behind the boundary, the API's, the MCP transport's and one that is neither.
+    for path in ["/v1/capabilities", "/mcp", "/elsewhere"] {
+        let r = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let r = client
+            .get(format!("{base}{path}"))
+            .header("authorization", "Bearer alice-token")
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let listed = client
+        .get(format!("{base}/v1/capabilities"))
+        .header("authorization", "Bearer alice-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    // And MCP works on the same listener.
+    let config =
+        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+            format!("{base}/mcp"),
+        )
+        .auth_header("alice-token".to_string());
+    let mcp = ()
+        .serve(rmcp::transport::StreamableHttpClientTransport::from_config(
+            config,
+        ))
+        .await
+        .unwrap();
+    assert!(!mcp.list_all_tools().await.unwrap().is_empty());
+}
+
+/// A validator for the response schema the document declares for `path`, `method` and `status`.
+fn response_validator(
+    doc: &Value,
+    path: &str,
+    method: &str,
+    status: &str,
+) -> jsonschema::Validator {
+    let schema =
+        &doc["paths"][path][method]["responses"][status]["content"]["application/json"]["schema"];
+    assert!(
+        schema.is_object(),
+        "{path} {method} {status} declares a schema"
+    );
+    let mut root = schema.clone();
+    root["components"] = doc["components"].clone();
+    jsonschema::validator_for(&root).expect("a valid schema")
+}
+
+#[tokio::test]
+async fn real_responses_validate_against_the_document_that_describes_them() {
+    let w = world().await;
+    let doc = w.get("alice-token", "/openapi.json").await.body;
+    let check = |path: &'static str, method: &'static str, reply: &Reply| {
+        let status = reply.status.as_u16().to_string();
+        let declared = if doc["paths"][path][method]["responses"][status.as_str()].is_object() {
+            status
+        } else if reply.status.is_client_error() {
+            "4XX".to_owned()
+        } else {
+            "5XX".to_owned()
+        };
+        let validator = response_validator(&doc, path, method, &declared);
+        assert!(
+            validator.is_valid(&reply.body),
+            "{path} {method} {} returned {}",
+            reply.status,
+            reply.body
+        );
+    };
+    let call_path = "/v1/capabilities/write/1/call";
+    let start_path = "/v1/capabilities/slow/1/start";
+    check(
+        call_path,
+        "post",
+        &w.post(
+            "alice-token",
+            "/capabilities/write/1/call",
+            json!({"input": {"x": 1}, "idempotency_key": "a"}),
+        )
+        .await,
+    );
+    check(
+        call_path,
+        "post",
+        &w.post(
+            "alice-token",
+            "/capabilities/write/1/call",
+            json!({"input": {"x": 2}, "idempotency_key": "a"}),
+        )
+        .await,
+    );
+    check(
+        call_path,
+        "post",
+        &w.post(
+            "alice-token",
+            "/capabilities/write/1/call",
+            json!({"input": {"x": "bad"}, "idempotency_key": "b"}),
+        )
+        .await,
+    );
+    check(
+        "/v1/capabilities/fails/1/call",
+        "post",
+        &w.post(
+            "alice-token",
+            "/capabilities/fails/1/call",
+            json!({"input": {}, "idempotency_key": "f"}),
+        )
+        .await,
+    );
+    check(
+        "/v1/capabilities/doubts/1/call",
+        "post",
+        &w.post(
+            "alice-token",
+            "/capabilities/doubts/1/call",
+            json!({"input": {}, "idempotency_key": "d"}),
+        )
+        .await,
+    );
+    check(
+        "/v1/capabilities/read/1/call",
+        "post",
+        &w.post(
+            "alice-token",
+            "/capabilities/read/1/call",
+            json!({"input": {"x": 1}}),
+        )
+        .await,
+    );
+    let running = w
+        .post(
+            "alice-token",
+            "/capabilities/slow/1/start",
+            json!({"input": {}, "idempotency_key": "s"}),
+        )
+        .await;
+    assert_eq!(running.status, StatusCode::ACCEPTED);
+    check(start_path, "post", &running);
+    let operation = running.body["operation"].as_str().unwrap().to_owned();
+    check(
+        "/v1/operations/{id}",
+        "get",
+        &w.get("alice-token", &format!("/operations/{operation}"))
+            .await,
+    );
+    check(
+        "/v1/operations/{id}",
+        "get",
+        &w.get("alice-token", "/operations/op-missing").await,
+    );
+    w.release.notify_one();
+    wait_until(|| w.calls.load(Ordering::SeqCst) >= 1).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let events = w
+                .get(
+                    "alice-token",
+                    &format!("/operations/{operation}/events?cursor=0"),
+                )
+                .await;
+            if events.body["events"].as_array().unwrap().len() == 2 {
+                check("/v1/operations/{id}/events", "get", &events);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed");
+    let finished = w
+        .post(
+            "alice-token",
+            "/capabilities/slow/1/start",
+            json!({"input": {}, "idempotency_key": "s"}),
+        )
+        .await;
+    assert_eq!(finished.body["state"], "finished");
+    check(start_path, "post", &finished);
+    // Something the document does not describe is refused.
+    let validator = response_validator(&doc, call_path, "post", "200");
+    assert!(!validator.is_valid(&json!({"outcome": 1})));
 }
