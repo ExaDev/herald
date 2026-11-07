@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/herald-boundary", "crates/herald-mcp", "crates/herald-http"]
+resolver = "3"
+
 [package]
 name = "herald"
 version = "0.1.0"

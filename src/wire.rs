@@ -55,6 +55,8 @@ pub enum ErrorCode {
     SourceFailed,
     /// The adapter could not authenticate the caller.
     Unauthenticated,
+    /// The request came from a host or origin the adapter does not serve.
+    ForbiddenOrigin,
 }
 
 /// An error as an adapter reports it.
