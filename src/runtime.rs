@@ -261,6 +261,10 @@ pub struct Submission {
     /// Set when the handler ran but its outcome could not be recorded. The record stays `Accepted`
     /// and reads as `Interrupted` after the next recovery.
     pub record_error: Option<StoreError>,
+    /// True when this delivery found the same key still running. The result is then the runtime's own
+    /// unknown outcome, not the operation's, and the operation is still in progress.
+    #[serde(default)]
+    pub in_flight: bool,
 }
 
 /// A request to run an operation under a caller-supplied idempotency key.
@@ -296,8 +300,7 @@ pub trait Transport: Send + Sync {
 /// One in-flight attempt to run an operation.
 struct Attempt {
     id: OperationId,
-    task: tokio::task::JoinHandle<(Result<Outcome, DispatchError>, Option<StoreError>)>,
-    reserved: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<Submission>,
     admitted: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
@@ -317,7 +320,7 @@ pub struct Runtime {
     dispatcher: Arc<Dispatcher>,
     store: Arc<dyn OperationStore>,
     lease: Arc<Lease>,
-    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 /// Holds the store claim until the runtime and every task it spawned are gone, so a new runtime
@@ -342,7 +345,7 @@ impl Runtime {
             dispatcher,
             lease: Arc::new(Lease(Arc::clone(&store))),
             store,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         };
         // On failure the runtime drops here and its lease releases the claim.
         let interrupted = runtime.store.recover().await?;
@@ -363,14 +366,14 @@ impl Runtime {
         cancellation: Cancellation,
     ) -> Submission {
         let attempt = self.spawn_attempt(request, key, cancellation);
-        self.finish(attempt).await
+        Self::finish(attempt).await
     }
 
     /// As [`Runtime::submit`], but returns as soon as the operation is running. A request that policy
-    /// or the store turns away finishes first and is returned as [`Started::Finished`]. Otherwise the
-    /// handler continues on its own task and records its outcome, and the operation can be followed
-    /// by id from any adapter through [`Runtime::get`] and [`Runtime::events_after`]. The same key
-    /// retried later replays the recorded outcome as for `submit`.
+    /// or the store turns away finishes first and is returned as [`Started::Finished`]. A key that is
+    /// already running returns the same [`Started::Running`] id. Otherwise the handler continues on
+    /// its own task, which records its outcome even if this future is dropped, and the operation can be
+    /// followed by id from any adapter through [`Runtime::get`] and [`Runtime::events_after`].
     pub async fn start(
         &self,
         request: Request,
@@ -383,24 +386,12 @@ impl Runtime {
             .take()
             .expect("a fresh attempt has its admission signal");
         tokio::select! {
-            signal = admitted => {
-                if signal.is_ok() {
-                    let id = attempt.id.clone();
-                    let store = Arc::clone(&self.store);
-                    // A panic after admission must still be recorded, as `submit` would.
-                    tokio::spawn(async move {
-                        let Attempt { id, task, reserved, .. } = attempt;
-                        if task.await.is_err() && reserved.load(Ordering::SeqCst) {
-                            let _ = store.abandon(&id).await;
-                        }
-                    });
-                    Started::Running(id)
-                } else {
-                    // The gate was dropped without admitting: the attempt has already finished.
-                    Started::Finished(self.finish(attempt).await)
-                }
-            }
-            submission = self.finish_ref(&mut attempt) => Started::Finished(submission),
+            signal = admitted => match signal {
+                Ok(()) => Started::Running(attempt.id),
+                // The gate ended without admitting: the attempt has finished or is about to.
+                Err(_) => Started::Finished(Self::finish(attempt).await),
+            },
+            submission = Self::finish_ref(&mut attempt) => Started::Finished(submission),
         }
     }
 
@@ -422,24 +413,64 @@ impl Runtime {
         let dispatcher = Arc::clone(&self.dispatcher);
         let store = Arc::clone(&self.store);
         let lease = Arc::clone(&self.lease);
-        let reserved = Arc::new(AtomicBool::new(false));
-        let task_reserved = Arc::clone(&reserved);
+        let tasks = Arc::clone(&self.tasks);
         let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
+        let attempt_id = id.clone();
+        // The outer task owns the lease and the attempt's bookkeeping, so everything below happens even
+        // if the caller drops its future: a panic in the handler is recorded, and the lease is released
+        // only after the record has been marked.
         let task = tokio::spawn(async move {
             let _lease = lease;
-            let gate = RuntimeGate {
-                store: store.as_ref(),
-                record,
-                reserved: task_reserved,
-                admitted: Mutex::new(Some(admit_tx)),
-                record_error: Mutex::new(None),
+            let reserved = Arc::new(AtomicBool::new(false));
+            let in_flight = Arc::new(AtomicBool::new(false));
+            let inner = {
+                let reserved = Arc::clone(&reserved);
+                let in_flight = Arc::clone(&in_flight);
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let gate = RuntimeGate {
+                        store: store.as_ref(),
+                        record,
+                        reserved,
+                        in_flight,
+                        admitted: Mutex::new(Some(admit_tx)),
+                        record_error: Mutex::new(None),
+                    };
+                    let result = dispatcher.dispatch_with(request, cancellation, &gate).await;
+                    let record_error = gate
+                        .record_error
+                        .into_inner()
+                        .expect("error lock is never poisoned");
+                    (result, record_error)
+                })
             };
-            let result = dispatcher.dispatch_with(request, cancellation, &gate).await;
-            let record_error = gate
-                .record_error
-                .into_inner()
-                .expect("error lock is never poisoned");
-            (result, record_error)
+            tasks
+                .lock()
+                .expect("task lock is never poisoned")
+                .push(inner.abort_handle());
+            match inner.await {
+                Ok((result, record_error)) => Submission {
+                    id: attempt_id,
+                    result,
+                    record_error,
+                    in_flight: in_flight.load(Ordering::SeqCst),
+                },
+                Err(_) => {
+                    // The handler panicked or was stopped at shutdown. Only an attempt that reserved the
+                    // record may mark it, or a failure before admission would interrupt another live attempt.
+                    let record_error = if reserved.load(Ordering::SeqCst) {
+                        store.abandon(&attempt_id).await.err()
+                    } else {
+                        None
+                    };
+                    Submission {
+                        id: attempt_id,
+                        result: Err(DispatchError::OutcomeLost),
+                        record_error,
+                        in_flight: false,
+                    }
+                }
+            }
         });
         {
             let mut tasks = self.tasks.lock().expect("task lock is never poisoned");
@@ -449,37 +480,24 @@ impl Runtime {
         Attempt {
             id,
             task,
-            reserved,
             admitted: Some(admit_rx),
         }
     }
 
-    async fn finish(&self, mut attempt: Attempt) -> Submission {
-        self.finish_ref(&mut attempt).await
+    async fn finish(mut attempt: Attempt) -> Submission {
+        Self::finish_ref(&mut attempt).await
     }
 
-    async fn finish_ref(&self, attempt: &mut Attempt) -> Submission {
-        let id = attempt.id.clone();
+    async fn finish_ref(attempt: &mut Attempt) -> Submission {
         match (&mut attempt.task).await {
-            Ok((result, record_error)) => Submission {
-                id,
-                result,
-                record_error,
+            Ok(submission) => submission,
+            // The supervising task itself was stopped by `shutdown`; nothing touches the store after release.
+            Err(_) => Submission {
+                id: attempt.id.clone(),
+                result: Err(DispatchError::OutcomeLost),
+                record_error: None,
+                in_flight: false,
             },
-            Err(_) => {
-                // The task panicked or was cancelled at shutdown. Only an attempt that reserved the
-                // record may mark it, or a failure before admission would interrupt another live attempt.
-                let record_error = if attempt.reserved.load(Ordering::SeqCst) {
-                    self.store.abandon(&id).await.err()
-                } else {
-                    None
-                };
-                Submission {
-                    id,
-                    result: Err(DispatchError::OutcomeLost),
-                    record_error,
-                }
-            }
         }
     }
 
@@ -569,11 +587,26 @@ impl Runtime {
 struct RuntimeGate<'a> {
     store: &'a dyn OperationStore,
     record: OperationRecord,
-    /// Set once this attempt holds the reservation, shared with the submitting future.
+    /// Set once this attempt holds the reservation.
     reserved: Arc<AtomicBool>,
+    /// Set when the key was found already running.
+    in_flight: Arc<AtomicBool>,
     /// Fired when the reservation is held and the handler is about to run, so `start` can return early.
     admitted: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     record_error: Mutex<Option<StoreError>>,
+}
+
+impl RuntimeGate<'_> {
+    fn signal_admitted(&self) {
+        if let Some(sender) = self
+            .admitted
+            .lock()
+            .expect("signal lock is never poisoned")
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
 }
 
 impl Gate for RuntimeGate<'_> {
@@ -595,9 +628,13 @@ impl Gate for RuntimeGate<'_> {
                 Ok(Reservation::Conflict) => Admission::Reject(DispatchError::KeyConflict),
                 Ok(Reservation::Existing(existing)) => match existing.state() {
                     OperationState::Completed(outcome) => Admission::Replay(outcome.clone()),
-                    OperationState::Accepted => Admission::Replay(Outcome::Unknown(
-                        json!({"source": "runtime", "operation": existing.id.0, "state": "accepted"}),
-                    )),
+                    OperationState::Accepted => {
+                        self.in_flight.store(true, Ordering::SeqCst);
+                        self.signal_admitted();
+                        Admission::Replay(Outcome::Unknown(
+                            json!({"source": "runtime", "operation": existing.id.0, "state": "accepted"}),
+                        ))
+                    }
                     OperationState::Interrupted => Admission::Replay(Outcome::Unknown(
                         json!({"source": "runtime", "operation": existing.id.0, "state": "interrupted"}),
                     )),

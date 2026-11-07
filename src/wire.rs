@@ -35,6 +35,10 @@ pub enum ErrorCode {
     Store,
     /// The request itself was malformed (a missing key, a bad cursor).
     BadRequest,
+    /// The same key is still running. Follow the operation by id instead of submitting again.
+    InProgress,
+    /// A product's source for a subscription failed; `detail` is its error object.
+    SourceFailed,
     /// The adapter could not authenticate the caller.
     Unauthenticated,
 }
@@ -63,9 +67,8 @@ impl From<&DispatchError> for WireError {
     fn from(error: &DispatchError) -> Self {
         use DispatchError as D;
         let (code, message) = match error {
-            D::NotFound | D::WrongCapabilityKind | D::DuplicateCapability => {
-                (ErrorCode::NotFound, "no such capability")
-            }
+            D::NotFound => (ErrorCode::NotFound, "no such capability"),
+            D::WrongCapabilityKind => (ErrorCode::BadRequest, "the capability is not of that kind"),
             D::Denied => (ErrorCode::Denied, "not authorised"),
             D::Unsupported => (ErrorCode::Unsupported, "the capability is not supported"),
             D::SupportUnknown => (
@@ -75,10 +78,21 @@ impl From<&DispatchError> for WireError {
             D::ConfirmationRequired => {
                 (ErrorCode::ConfirmationRequired, "confirmation is required")
             }
-            D::InvalidInput(_) => (
-                ErrorCode::InvalidInput,
-                "the input does not match the capability's schema",
-            ),
+            // The message names the caller's own input against the published schema, so it is safe to return.
+            D::InvalidInput(detail) => {
+                return Self {
+                    code: ErrorCode::InvalidInput,
+                    message: "the input does not match the capability's schema".into(),
+                    detail: Some(Value::String(detail.clone())),
+                };
+            }
+            D::SubscriptionSource(source) => {
+                return Self {
+                    code: ErrorCode::SourceFailed,
+                    message: "the source failed".into(),
+                    detail: Some(source.clone()),
+                };
+            }
             D::KeyConflict => (
                 ErrorCode::KeyConflict,
                 "the idempotency key was used for a different request",
@@ -89,8 +103,8 @@ impl From<&DispatchError> for WireError {
             D::InvalidOutput(_)
             | D::InvalidError(_)
             | D::InvalidEvent(_)
-            | D::SubscriptionSource(_)
-            | D::InvalidSchema(_) => (
+            | D::InvalidSchema(_)
+            | D::DuplicateCapability => (
                 ErrorCode::ContractViolation,
                 "the handler's response broke its contract",
             ),
