@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/herald-boundary"]
+resolver = "3"
+
 [package]
 name = "herald"
 version = "0.1.0"
