@@ -475,7 +475,7 @@ async fn oversized_keys_and_inputs_are_refused_before_anything_runs() {
         )
         .await
         .unwrap_err();
-    assert_eq!(long.code, ErrorCode::BadRequest);
+    assert_eq!(long.code, ErrorCode::TooLarge);
     let big = json!({"blob": "x".repeat(MAX_INPUT_BYTES)});
     let large = service
         .call(
@@ -488,7 +488,7 @@ async fn oversized_keys_and_inputs_are_refused_before_anything_runs() {
         )
         .await
         .unwrap_err();
-    assert_eq!(large.code, ErrorCode::BadRequest);
+    assert_eq!(large.code, ErrorCode::TooLarge);
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -537,9 +537,10 @@ async fn an_oversized_request_gets_one_answer_whether_the_capability_exists_or_n
             )
             .await
             .unwrap_err();
-        assert_eq!(long_key.code, ErrorCode::BadRequest, "{name}");
-        assert_eq!(long_start.code, ErrorCode::BadRequest, "{name}");
-        assert_eq!(huge_call.code, ErrorCode::BadRequest, "{name}");
+        // The key is judged after authorisation, so a denied caller sees only not_found.
+        assert_eq!(long_key.code, ErrorCode::NotFound, "{name}");
+        assert_eq!(long_start.code, ErrorCode::NotFound, "{name}");
+        assert_eq!(huge_call.code, ErrorCode::TooLarge, "{name}");
         let denied = service
             .call(
                 &mallory,
@@ -569,20 +570,25 @@ async fn an_oversized_request_gets_one_answer_whether_the_capability_exists_or_n
         )
         .await
         .unwrap_err();
-    assert_eq!(told.code, ErrorCode::BadRequest);
-    assert_eq!(
-        Service::check_bounds(&json!({}), Some(&key))
-            .unwrap_err()
-            .code,
-        ErrorCode::BadRequest
-    );
-    assert!(
-        Service::check_bounds(
-            &json!({"input": {"x": 1}, "idempotency_key": "k"}),
-            Some("k")
+    assert_eq!(told.code, ErrorCode::TooLarge);
+    // An authorised caller is told the key is too long, for an operation.
+    let long = service
+        .call(
+            &alice,
+            Surface::Api,
+            &id("write"),
+            json!({}),
+            Some(key),
+            live(),
         )
-        .is_ok()
+        .await
+        .unwrap_err();
+    assert_eq!(long.code, ErrorCode::TooLarge);
+    assert_eq!(
+        Service::check_bounds(&huge).unwrap_err().code,
+        ErrorCode::TooLarge
     );
+    assert!(Service::check_bounds(&json!({"input": {"x": 1}, "idempotency_key": "k"})).is_ok());
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1336,4 +1342,110 @@ async fn capability_names_must_be_addressable_on_every_surface() {
         d.register(contract(good, Kind::Query, false), work())
             .unwrap_or_else(|e| panic!("{good:?} -> {e:?}"));
     }
+}
+
+/// Allows the first authorisation and refuses every later one, as an expiring grant would.
+struct Flaky(AtomicUsize);
+impl Authorizer for Flaky {
+    fn authorize<'a>(&'a self, _: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
+        Box::pin(async move { self.0.fetch_add(1, Ordering::SeqCst) == 0 })
+    }
+}
+
+#[tokio::test]
+async fn a_denial_after_the_first_authorisation_still_looks_like_an_unknown_capability() {
+    let flaky = Arc::new(Flaky(AtomicUsize::new(0)));
+    let ports = Arc::new(Ports {
+        allowed: &["alice"],
+        confirm: AtomicBool::new(true),
+        confirm_claimed: false,
+    });
+    let mut d = Dispatcher::new(flaky, ports.clone(), ports.clone(), ports);
+    let calls = Arc::new(AtomicUsize::new(0));
+    d.register(
+        contract("read", Kind::Query, false),
+        Arc::new(Work {
+            calls: calls.clone(),
+            seen: Arc::new(Mutex::new(vec![])),
+            release: Arc::new(Notify::new()),
+            mode: Mode::Immediate,
+        }),
+    )
+    .unwrap();
+    let d = Arc::new(d);
+    let (runtime, _) = Runtime::open(d.clone(), Arc::new(MemoryOperationStore::default()))
+        .await
+        .unwrap();
+    let service = Service::new(
+        d,
+        Arc::new(runtime),
+        Exposure::none().allow(Surface::Api, id("read")),
+    );
+    let error = service
+        .call(
+            &who("alice"),
+            Surface::Api,
+            &id("read"),
+            json!({}),
+            None,
+            live(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound, "not denied: {error:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_subscription_is_not_a_capability_a_service_can_call_whatever_the_payload() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    for payload in [json!({}), json!({"extra": 1}), json!([1])] {
+        let error = service
+            .call(
+                &who("alice"),
+                Surface::Api,
+                &id("events"),
+                payload.clone(),
+                None,
+                live(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound, "{payload}");
+    }
+}
+
+#[tokio::test]
+async fn a_query_input_field_named_like_the_key_is_input_and_not_a_key() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let long = "k".repeat(MAX_KEY_BYTES + 1);
+    let prepared = service
+        .prepare(
+            &who("alice"),
+            Surface::Api,
+            &id("read"),
+            json!({"idempotency_key": long}),
+            |_| Shape::Direct,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.key, None);
+    assert_eq!(prepared.input["idempotency_key"], json!(long));
+}
+
+#[tokio::test]
+async fn a_validator_message_in_an_error_is_bounded_whatever_the_input() {
+    use herald::wire::MAX_DETAIL_BYTES;
+    let quoted = DispatchError::InvalidInput("é".repeat(MAX_DETAIL_BYTES));
+    let error = WireError::from(&quoted);
+    let Some(Value::String(detail)) = error.detail else {
+        panic!("a detail")
+    };
+    assert!(detail.len() <= MAX_DETAIL_BYTES);
+    assert!(
+        detail.chars().all(|c| c == 'é'),
+        "cut on a character boundary"
+    );
 }

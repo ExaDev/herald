@@ -25,6 +25,12 @@ pub enum ErrorCode {
     KeyConflict,
     /// The request was cancelled before it ran.
     Cancelled,
+    /// The server could not take the request now, for example because it is at its concurrency
+    /// limit or its authentication backend failed. Nothing ran, and a retry is safe.
+    Unavailable,
+    /// The request ran past its deadline and was dropped. A synchronous call's handler was told to
+    /// stop, so for an operation the outcome may be unknown: follow it by id.
+    TimedOut,
     /// The request was interrupted before the handler started, so nothing ran.
     Interrupted,
     /// The handler may have run and its outcome is unknown.
@@ -57,6 +63,18 @@ pub struct WireError {
     pub detail: Option<Value>,
 }
 
+/// The most of a validator's text a response carries. The text can quote the offending input, so
+/// without a bound a response would be as large as the request that caused it.
+pub const MAX_DETAIL_BYTES: usize = 1024;
+
+fn truncated(text: &str) -> &str {
+    let mut end = text.len().min(MAX_DETAIL_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 impl WireError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
@@ -87,7 +105,7 @@ impl From<&DispatchError> for WireError {
                 return Self {
                     code: ErrorCode::InvalidInput,
                     message: "the input does not match the capability's schema".into(),
-                    detail: Some(Value::String(detail.clone())),
+                    detail: Some(Value::String(truncated(detail).to_owned())),
                 };
             }
             D::SubscriptionSource(source) => {

@@ -213,8 +213,7 @@ impl Service {
         payload: Value,
         shape: impl FnOnce(&Kind) -> Shape,
     ) -> Result<Prepared, WireError> {
-        let key_hint = payload.get("idempotency_key").and_then(Value::as_str);
-        Self::check_bounds(&payload, key_hint)?;
+        Self::check_bounds(&payload)?;
         let kind = self.kind_of(surface, capability)?;
         let shape = shape(&kind);
         let probe = match shape {
@@ -282,7 +281,7 @@ impl Service {
                     .dispatcher
                     .dispatch(request, cancellation)
                     .await
-                    .map_err(|e| WireError::from(&e))?;
+                    .map_err(|e| dispatch_error(&e))?;
                 Ok(Executed::Call(CallResult::new(None, outcome, false)))
             }
             Kind::Operation if start => {
@@ -402,21 +401,15 @@ impl Service {
         }
     }
 
-    /// Checks a raw request payload and key against the size bounds. An adapter calls this for every
-    /// request, whatever tool or capability it names, before any lookup, so the answer for an
-    /// oversized request is the same for an exposed capability, an unexposed one and an unknown one.
-    pub fn check_bounds(payload: &Value, key: Option<&str>) -> Result<(), WireError> {
-        if key.is_some_and(|k| k.len() > MAX_KEY_BYTES) {
-            return Err(WireError::new(
-                ErrorCode::BadRequest,
-                "the idempotency key is too long",
-            ));
-        }
+    /// Checks a raw request payload against the size bound. An adapter calls this for every request,
+    /// whatever tool or capability it names, before any lookup, so the answer for an oversized
+    /// request is the same for an exposed capability, an unexposed one and an unknown one. The
+    /// bound is on the serialised value, which can be larger than the bytes received (a number is
+    /// written back in its shortest form, which can be longer than the literal sent). The key
+    /// length is judged later, after authorisation, because only an envelope has a key.
+    pub fn check_bounds(payload: &Value) -> Result<(), WireError> {
         if payload.to_string().len() > MAX_REQUEST_BYTES {
-            return Err(WireError::new(
-                ErrorCode::BadRequest,
-                "the request is too large",
-            ));
+            return Err(too_large("the request is too large"));
         }
         Ok(())
     }
@@ -438,6 +431,8 @@ impl Service {
         self.dispatcher
             .contracts()
             .find(|c| &c.id == capability)
+            // A subscription is not callable through a service, so it looks like no capability at all.
+            .filter(|c| c.kind != Kind::Subscription)
             .map(|c| c.kind.clone())
             .ok_or_else(not_found)
     }
@@ -453,18 +448,24 @@ fn store(_: crate::runtime::StoreError) -> WireError {
 }
 fn bound(input: &Value, key: Option<&str>) -> Result<(), WireError> {
     if key.is_some_and(|k| k.len() > MAX_KEY_BYTES) {
-        return Err(WireError::new(
-            ErrorCode::BadRequest,
-            "the idempotency key is too long",
-        ));
+        return Err(too_large("the idempotency key is too long"));
     }
     if input.to_string().len() > MAX_INPUT_BYTES {
-        return Err(WireError::new(
-            ErrorCode::BadRequest,
-            "the input is too large",
-        ));
+        return Err(too_large("the input is too large"));
     }
     Ok(())
+}
+fn too_large(message: &'static str) -> WireError {
+    WireError::new(ErrorCode::TooLarge, message)
+}
+/// A dispatch error as the client sees it. A denial that arrives after `prepare` has already
+/// authorised the caller (the product's authorizer changed its mind between the two checks) is
+/// still shown as an unknown capability, so no path tells a caller that something exists.
+fn dispatch_error(error: &DispatchError) -> WireError {
+    match error {
+        DispatchError::Denied => not_found(),
+        other => WireError::from(other),
+    }
 }
 fn require_key(key: Option<String>) -> Result<String, WireError> {
     key.filter(|k| !k.is_empty()).ok_or_else(|| {
@@ -487,7 +488,7 @@ fn finished(submission: crate::runtime::Submission) -> Result<CallResult, WireEr
             outcome,
             submission.record_error.is_none(),
         )),
-        Err(error) => Err(WireError::from(&error)),
+        Err(error) => Err(dispatch_error(&error)),
     }
 }
 
