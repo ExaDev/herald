@@ -53,9 +53,17 @@ impl Observer for Policy {
     fn subscription_opened(&self, _: &Request, _: u64, _: &Result<(), DispatchError>) {}
 }
 
+#[derive(Clone, Copy)]
+enum Behaviour {
+    Succeed,
+    Fail,
+    Doubt,
+}
+
 struct Work {
     calls: Arc<AtomicUsize>,
     release: Option<Arc<Notify>>,
+    behaviour: Behaviour,
 }
 impl Handler for Work {
     fn invoke<'a>(&'a self, r: &'a Request, _: Cancellation) -> PortFuture<'a, Outcome> {
@@ -64,7 +72,12 @@ impl Handler for Work {
             if let Some(release) = &self.release {
                 release.notified().await;
             }
-            Outcome::Success(json!({"caller": r.identity, "input": r.input}))
+            let body = json!({"caller": r.identity, "input": r.input});
+            match self.behaviour {
+                Behaviour::Succeed => Outcome::Success(body),
+                Behaviour::Fail => Outcome::Error(body),
+                Behaviour::Doubt => Outcome::Unknown(body),
+            }
         })
     }
 }
@@ -115,16 +128,19 @@ async fn world() -> World {
     let policy = Arc::new(Policy);
     let (calls, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
     let mut d = Dispatcher::new(policy.clone(), policy.clone(), policy.clone(), policy);
-    for (name, kind, wait) in [
-        ("read", Kind::Query, false),
-        ("write", Kind::Operation, false),
-        ("slow", Kind::Operation, true),
+    for (name, kind, wait, behaviour) in [
+        ("read", Kind::Query, false, Behaviour::Succeed),
+        ("write", Kind::Operation, false, Behaviour::Succeed),
+        ("slow", Kind::Operation, true, Behaviour::Succeed),
+        ("fails", Kind::Operation, false, Behaviour::Fail),
+        ("doubts", Kind::Operation, false, Behaviour::Doubt),
     ] {
         d.register(
             contract(name, kind),
             Arc::new(Work {
                 calls: calls.clone(),
                 release: wait.then(|| release.clone()),
+                behaviour,
             }),
         )
         .unwrap();
@@ -133,7 +149,7 @@ async fn world() -> World {
     let (runtime, _) = Runtime::open(d.clone(), Arc::new(MemoryOperationStore::default()))
         .await
         .unwrap();
-    let exposure = ["read", "write", "slow"]
+    let exposure = ["read", "write", "slow", "fails", "doubts"]
         .into_iter()
         .fold(Exposure::none(), |e, n| e.allow(Surface::Mcp, id(n)));
     let service = Arc::new(Service::new(d, Arc::new(runtime), exposure));
@@ -143,7 +159,9 @@ async fn world() -> World {
     let policy = OriginPolicy::new([format!("127.0.0.1:{port}")], [ORIGIN.to_string()]).unwrap();
     let app = router(service.clone(), Boundary::new(Arc::new(Tokens), policy));
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
     });
     World {
         service,
@@ -220,6 +238,8 @@ async fn both_transports_expose_the_same_tools_with_the_same_schemas() {
     assert_eq!(
         names,
         vec![
+            "doubts.v1",
+            "fails.v1",
             EVENTS_TOOL,
             OPERATION_TOOL,
             "read.v1",
@@ -263,6 +283,24 @@ async fn the_same_calls_give_the_same_results_over_both_transports() {
         ),
         ("nothing.v1", json!({})),
         ("read", json!({})),
+        ("read.v01", json!({"x": 1})),
+        ("read.v+1", json!({"x": 1})),
+        (
+            "fails.v1",
+            json!({"idempotency_key": "f1", "input": {"x": 1}}),
+        ),
+        (
+            "doubts.v1",
+            json!({"idempotency_key": "d1", "input": {"x": 1}}),
+        ),
+        (
+            "write.v1",
+            json!({"idempotency_key": "k3", "input": {}, "detach": "yes"}),
+        ),
+        (
+            "write.v1",
+            json!({"idempotency_key": "k3", "input": {}, "extra": 1}),
+        ),
     ] {
         let a = call(&stdio, tool, arguments.clone()).await;
         let b = call(&network, tool, arguments.clone()).await;
@@ -296,10 +334,11 @@ async fn the_same_calls_give_the_same_results_over_both_transports() {
         error_code(&call(&stdio, "nothing.v1", json!({})).await),
         "not_found"
     );
-    // Handler runs: three successful reads (stdio, network and the spot check above) and the write for
-    // `k1` exactly once, though it was delivered three times over two transports. Nothing else ran:
-    // the invalid, conflicting, keyless and unknown calls never reached a handler.
-    assert_eq!(world.calls.load(Ordering::SeqCst), 3 + 1);
+    // Handler runs: three successful reads (stdio, network and the spot check above), the write for
+    // `k1` exactly once though it was delivered three times over two transports, and `f1` and `d1`
+    // once each, though each went over both transports. Nothing else ran: the invalid, conflicting,
+    // keyless, unknown and mis-shaped calls never reached a handler.
+    assert_eq!(world.calls.load(Ordering::SeqCst), 3 + 1 + 1 + 1);
 }
 
 #[tokio::test]
@@ -393,14 +432,23 @@ async fn a_retry_of_a_running_key_is_in_progress_not_a_lost_outcome() {
         json!({"idempotency_key": "k", "input": {}, "detach": true}),
     )
     .await;
-    let waited = call(
-        &client,
-        "slow.v1",
-        json!({"idempotency_key": "k", "input": {}}),
+    let waited = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(
+            &client,
+            "slow.v1",
+            json!({"idempotency_key": "k", "input": {}}),
+        ),
     )
-    .await;
+    .await
+    .expect("a retry of a running key answers instead of waiting");
     assert!(is_error(&waited));
     assert_eq!(error_code(&waited), "in_progress");
+    assert_eq!(
+        world.calls.load(Ordering::SeqCst),
+        1,
+        "the retry ran nothing"
+    );
     world.release.notify_one();
 }
 
@@ -415,4 +463,192 @@ async fn malformed_follow_arguments_are_protocol_errors_not_tool_results() {
         )
         .await;
     assert!(result.is_err(), "a non-string id is a malformed request");
+}
+
+#[tokio::test]
+async fn an_error_outcome_is_flagged_and_an_unknown_one_is_marked_uncertain_on_both_transports() {
+    let world = world().await;
+    for client in [
+        stdio_client(&world, "alice").await,
+        network_client(&world, "alice-token").await,
+    ] {
+        let failed = call(
+            &client,
+            "fails.v1",
+            json!({"idempotency_key": "f", "input": {}}),
+        )
+        .await;
+        assert!(is_error(&failed), "an error outcome is a tool error");
+        assert_eq!(structured(&failed)["failed"], true);
+        assert!(structured(&failed)["outcome"]["Error"].is_object());
+
+        let doubted = call(
+            &client,
+            "doubts.v1",
+            json!({"idempotency_key": "d", "input": {}}),
+        )
+        .await;
+        assert!(!is_error(&doubted), "an unknown outcome is not a failure");
+        assert_eq!(structured(&doubted)["uncertain"], true);
+        assert!(structured(&doubted)["outcome"]["Unknown"].is_object());
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_request_gets_one_answer_whatever_it_names() {
+    let world = world().await;
+    for client in [
+        stdio_client(&world, "alice").await,
+        stdio_client(&world, "mallory").await,
+        network_client(&world, "mallory-token").await,
+    ] {
+        let huge_key = "k".repeat(300);
+        let mut answers = Vec::new();
+        for tool in ["write.v1", "nothing.v1", "read.v1"] {
+            let result = call(
+                &client,
+                tool,
+                json!({"idempotency_key": huge_key, "input": {}}),
+            )
+            .await;
+            assert!(is_error(&result));
+            answers.push(structured(&result));
+        }
+        assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
+        assert_eq!(answers[0]["error"]["code"], "bad_request");
+    }
+    assert_eq!(world.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn events_are_read_from_the_cursor_given() {
+    let world = world().await;
+    let client = stdio_client(&world, "alice").await;
+    let done = call(
+        &client,
+        "write.v1",
+        json!({"idempotency_key": "e", "input": {}}),
+    )
+    .await;
+    let operation = structured(&done)["operation"].as_str().unwrap().to_owned();
+    for (cursor, expected) in [(0, 2), (1, 1), (2, 0), (99, 0)] {
+        let r = call(
+            &client,
+            EVENTS_TOOL,
+            json!({"id": operation, "cursor": cursor}),
+        )
+        .await;
+        assert_eq!(
+            structured(&r)["events"].as_array().unwrap().len(),
+            expected,
+            "cursor {cursor}"
+        );
+    }
+    let default = call(&client, EVENTS_TOOL, json!({"id": operation})).await;
+    assert_eq!(structured(&default)["events"].as_array().unwrap().len(), 2);
+    for bad in [
+        json!({"id": operation, "cursor": -1}),
+        json!({"id": operation, "cursor": "0"}),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(EVENTS_TOOL.to_string()).with_arguments(args(bad)),
+            )
+            .await;
+        assert!(result.is_err(), "a malformed cursor is a protocol error");
+    }
+}
+
+/// POSTs a JSON-RPC `initialize` to the network transport with the given headers.
+async fn initialize(world: &World, headers: &[(&str, &str)]) -> reqwest::Response {
+    let mut request = reqwest::Client::new()
+        .post(&world.url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}}
+        }));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn the_network_transport_enforces_authentication_and_origin_policy_at_its_boundary() {
+    let world = world().await;
+    let bearer = ("authorization", "Bearer alice-token");
+    for (headers, status, code) in [
+        (vec![], 401, "unauthenticated"),
+        (
+            vec![("authorization", "Bearer wrong")],
+            401,
+            "unauthenticated",
+        ),
+        (
+            vec![bearer, ("origin", "https://evil.test")],
+            403,
+            "forbidden_origin",
+        ),
+        (vec![bearer, ("origin", "null")], 403, "forbidden_origin"),
+        (
+            vec![bearer, ("host", "rebound.test")],
+            403,
+            "forbidden_origin",
+        ),
+    ] {
+        let response = initialize(&world, &headers).await;
+        assert_eq!(response.status().as_u16(), status, "{headers:?}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code, "{headers:?}");
+    }
+    // Refused requests ran nothing, and an admitted one works and creates no session.
+    let response = initialize(&world, &[bearer, ("origin", ORIGIN)]).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response.headers().get("mcp-session-id").is_none(),
+        "the transport is stateless: there is no session to steal or exhaust"
+    );
+}
+
+#[tokio::test]
+async fn the_sdk_refuses_a_foreign_origin_even_without_the_boundary() {
+    let world = world().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let policy = OriginPolicy::new([address.to_string()], [ORIGIN.to_string()]).unwrap();
+    let boundary = Boundary::new(Arc::new(Tokens), policy);
+    let app = herald_mcp::routes(world.service.clone(), &boundary);
+    let url = format!("http://{address}/mcp");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("origin", "https://evil.test")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+}
+
+#[tokio::test]
+async fn the_unguarded_routes_refuse_every_call_because_no_boundary_named_a_caller() {
+    let world = world().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let policy = OriginPolicy::new([address.to_string()], [ORIGIN.to_string()]).unwrap();
+    let boundary = Boundary::new(Arc::new(Tokens), policy);
+    let app = herald_mcp::routes(world.service.clone(), &boundary);
+    let url = format!("http://{address}/mcp");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = StreamableHttpClientTransportConfig::with_uri(url);
+    let client = ().serve(StreamableHttpClientTransport::from_config(config)).await;
+    let client = client.expect("the SDK admits a host in its list; the handler refuses the call");
+    assert!(client.list_all_tools().await.is_err());
+    assert_eq!(world.calls.load(Ordering::SeqCst), 0);
 }

@@ -10,16 +10,26 @@
 //! - an operation is `name.vN` and takes `{"idempotency_key", "input", "detach"?}`;
 //! - `herald.operation` and `herald.events` follow an operation by id.
 //!
-//! A tool-level failure is a result with `isError: true` and a typed [`WireError`]. A malformed
-//! request, such as arguments that are not an object, is an MCP protocol error.
+//! A tool-level failure is a result with `isError: true` and a typed [`WireError`]. A result whose
+//! operation reported an error outcome is also flagged, and one whose outcome is unknown carries
+//! `"uncertain": true` in its body, as it does on the HTTP API. A malformed request, such as
+//! arguments that are not an object, is an MCP protocol error.
+//!
+//! The network transport is stateless: no session is created, so a session id cannot be stolen,
+//! replayed or used to end another caller's stream, and a caller cannot open sessions to exhaust the
+//! server. Every request is authenticated on its own.
 
 use herald::{
-    CapabilityId, Kind,
+    Cancellation, CapabilityId, Kind,
     exposure::Surface,
     runtime::OperationId,
-    service::{Descriptor, MAX_KEY_BYTES, Principal, Service},
+    service::{
+        CallResult, Descriptor, Executed, MAX_KEY_BYTES, Mode, Principal, Service, Shape,
+        StartResult,
+    },
     wire::{ErrorCode, WireError},
 };
+use herald_boundary::{Boundary, Guarded};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
@@ -87,11 +97,14 @@ pub fn tool_name(id: &CapabilityId) -> String {
     format!("{}.v{}", id.name, id.version)
 }
 
+/// The capability a tool name addresses. Only the canonical spelling resolves: `read.v01` and
+/// `read.v+1` are not `read.v1`, so a rule written against the advertised name cannot be sidestepped.
 fn capability_of(tool: &str) -> Option<CapabilityId> {
-    let (name, version) = tool.rsplit_once(".v")?;
-    Some(CapabilityId {
+    let (name, suffix) = tool.rsplit_once(".v")?;
+    let version: u32 = suffix.parse().ok()?;
+    (version.to_string() == suffix).then(|| CapabilityId {
         name: name.to_owned(),
-        version: version.parse().ok()?,
+        version,
     })
 }
 
@@ -102,33 +115,58 @@ fn object(value: Value) -> Arc<Map<String, Value>> {
     }
 }
 
-/// The input schema as a tool exposes it. A schema that is not an object schema is replaced by the
-/// loosest object, because MCP tool arguments are always an object.
+/// Whether a schema can describe a JSON object, which is all an MCP tool's arguments can be.
+fn accepts_object(schema: &Value) -> bool {
+    match schema {
+        Value::Bool(allowed) => *allowed,
+        Value::Object(map) => match map.get("type") {
+            None => true,
+            Some(Value::String(t)) => t == "object",
+            Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
+            Some(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// The input schema as a tool exposes it: the capability's own schema, verbatim, and for an operation
+/// wrapped with the idempotency key. Definitions the schema refers to are hoisted to the wrapper root
+/// so a `#/$defs/...` reference still resolves after nesting.
 fn tool_input_schema(descriptor: &Descriptor) -> Value {
-    let input = match &descriptor.input_schema {
-        Value::Object(_) => descriptor.input_schema.clone(),
-        _ => json!({"type": "object"}),
-    };
     match descriptor.kind {
-        Kind::Operation => json!({
-            "type": "object",
-            "required": ["idempotency_key", "input"],
-            "additionalProperties": false,
-            "properties": {
-                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": MAX_KEY_BYTES},
-                "input": input,
-                "detach": {
-                    "type": "boolean",
-                    "description": "Return the operation id as soon as it is running instead of waiting for its outcome."
+        Kind::Operation => {
+            let mut wrapper = json!({
+                "type": "object",
+                "required": ["idempotency_key", "input"],
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": format!("At most {MAX_KEY_BYTES} bytes. A retry with the same key replays the recorded outcome."),
+                    },
+                    "input": descriptor.input_schema,
+                    "detach": {
+                        "type": "boolean",
+                        "description": "Return the operation id as soon as it is running instead of waiting for its outcome."
+                    }
+                }
+            });
+            if let Value::Object(input) = &descriptor.input_schema {
+                for definitions in ["$defs", "definitions"] {
+                    if let Some(defs) = input.get(definitions) {
+                        wrapper[definitions] = defs.clone();
+                    }
                 }
             }
-        }),
-        _ => input,
+            wrapper
+        }
+        _ => descriptor.input_schema.clone(),
     }
 }
 
 fn tool_of(descriptor: &Descriptor) -> Tool {
-    let mut tool = Tool::new(
+    Tool::new(
         Cow::Owned(tool_name(&descriptor.id)),
         Cow::Owned(match descriptor.kind {
             Kind::Operation => format!(
@@ -141,9 +179,7 @@ fn tool_of(descriptor: &Descriptor) -> Tool {
             ),
         }),
         object(tool_input_schema(descriptor)),
-    );
-    tool.output_schema = None;
-    tool
+    )
 }
 
 fn follow_tool(name: &'static str, description: &'static str, schema: Value) -> Tool {
@@ -164,11 +200,49 @@ fn not_found() -> CallToolResponse {
     failure(WireError::new(ErrorCode::NotFound, "no such capability"))
 }
 
+/// A completed call. A result whose operation reported an error outcome is flagged as a tool error,
+/// the same signal on every path. An unknown outcome is not an error: it carries `"uncertain": true`
+/// so a client sees the operation may have run.
+fn call_response(call: &CallResult) -> CallToolResponse {
+    let value = json!(call);
+    if call.failed {
+        CallToolResult::structured_error(value).into()
+    } else {
+        success(value)
+    }
+}
+
+fn executed_response(executed: Executed) -> CallToolResponse {
+    match executed {
+        Executed::Call(call) => call_response(&call),
+        Executed::Start(StartResult::Finished(call)) => call_response(&call),
+        Executed::Start(running) => success(json!(running)),
+    }
+}
+
 fn string_arg<'a>(arguments: &'a Map<String, Value>, name: &str) -> Result<&'a str, McpError> {
     arguments
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| McpError::invalid_params(format!("`{name}` must be a string"), None))
+}
+
+/// A cancellation that fires when the protocol cancels the request. The returned guard stops the
+/// forwarding task when the call ends, so it never outlives the request.
+fn cancellation_from(context: &RequestContext<RoleServer>) -> (Cancellation, impl Drop) {
+    struct Stop(tokio::task::JoinHandle<()>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (sender, cancellation) = herald::cancellation();
+    let token = context.ct.clone();
+    let forward = tokio::spawn(async move {
+        token.cancelled().await;
+        let _ = sender.send(true);
+    });
+    (cancellation, Stop(forward))
 }
 
 impl ServerHandler for HeraldMcp {
@@ -193,6 +267,8 @@ impl ServerHandler for HeraldMcp {
             .list(&principal, Surface::Mcp)
             .await
             .iter()
+            // A tool's arguments are an object, so a query whose input cannot be one is not offered.
+            .filter(|d| d.kind != Kind::Query || accepts_object(&d.input_schema))
             .map(tool_of)
             .collect();
         tools.push(follow_tool(
@@ -220,11 +296,21 @@ impl ServerHandler for HeraldMcp {
                 None,
             ));
         };
-        let arguments = request.arguments.unwrap_or_default();
+        let payload = Value::Object(request.arguments.unwrap_or_default());
         let name = request.name.as_ref();
 
+        // Sizes are judged first and alike for every name, so an oversized request cannot tell an
+        // exposed tool from an unknown one.
+        let key_hint = payload.get("idempotency_key").and_then(Value::as_str);
+        if let Err(error) = Service::check_bounds(&payload, key_hint) {
+            return Ok(failure(error));
+        }
+        let Value::Object(arguments) = &payload else {
+            unreachable!("the payload was built as an object");
+        };
+
         if name == OPERATION_TOOL || name == EVENTS_TOOL {
-            let id = OperationId(string_arg(&arguments, "id")?.to_owned());
+            let id = OperationId(string_arg(arguments, "id")?.to_owned());
             return Ok(if name == OPERATION_TOOL {
                 match self.service.operation(&principal, Surface::Mcp, &id).await {
                     Ok(view) => success(json!(view)),
@@ -248,91 +334,51 @@ impl ServerHandler for HeraldMcp {
             });
         }
 
-        // An unknown tool, an unexposed one and one the caller may not use all look the same.
+        // An unknown, unexposed or denied tool all look the same: the service authorises before it
+        // looks at the payload's shape or tells the caller anything that depends on the capability.
         let Some(capability) = capability_of(name) else {
             return Ok(not_found());
         };
-        let Some(kind) = self.service.kind(Surface::Mcp, &capability) else {
-            return Ok(not_found());
+        let prepared = match self
+            .service
+            .prepare(
+                &principal,
+                Surface::Mcp,
+                &capability,
+                payload,
+                |kind| match kind {
+                    Kind::Operation => Shape::Envelope,
+                    _ => Shape::Direct,
+                },
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(failure(error)),
         };
-        // The arguments are passed on as received: a missing key or input is judged by the service
-        // after it has authorised the caller, so a denied caller cannot probe a tool's shape.
-        let cancellation = herald::cancellation().1;
-        Ok(match kind {
-            Kind::Query => {
-                let result = self
-                    .service
-                    .call(
-                        &principal,
-                        Surface::Mcp,
-                        &capability,
-                        Value::Object(arguments),
-                        None,
-                        cancellation,
-                    )
-                    .await;
-                call_response(result)
-            }
-            Kind::Operation => {
-                let key = arguments
-                    .get("idempotency_key")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let input = arguments.get("input").cloned().unwrap_or(Value::Null);
-                if arguments
-                    .get("detach")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    match self
-                        .service
-                        .start(
-                            &principal,
-                            Surface::Mcp,
-                            &capability,
-                            input,
-                            key,
-                            cancellation,
-                        )
-                        .await
-                    {
-                        Ok(started) => success(json!(started)),
-                        Err(error) => failure(error),
-                    }
-                } else {
-                    let result = self
-                        .service
-                        .call(
-                            &principal,
-                            Surface::Mcp,
-                            &capability,
-                            input,
-                            key,
-                            cancellation,
-                        )
-                        .await;
-                    call_response(result)
-                }
-            }
-            Kind::Subscription => not_found(),
-        })
-    }
-}
-
-/// A completed call. A product's error outcome is a tool error, an unknown outcome is not: the
-/// client must see that the operation may have run.
-fn call_response(result: Result<herald::service::CallResult, WireError>) -> CallToolResponse {
-    match result {
-        Ok(call) => {
-            let is_error = matches!(call.outcome, herald::Outcome::Error(_));
-            let value = json!(call);
-            if is_error {
-                CallToolResult::structured_error(value).into()
-            } else {
-                success(value)
-            }
-        }
-        Err(error) => failure(error),
+        // A synchronous call ends when the protocol cancels the request. A detached operation outlives
+        // the request that started it, so the request's cancellation must not reach it.
+        let detached = prepared.kind == Kind::Operation && prepared.detach;
+        let (cancellation, _stop) = if detached {
+            (herald::cancellation().1, None)
+        } else {
+            let (cancellation, stop) = cancellation_from(&context);
+            (cancellation, Some(stop))
+        };
+        let mode = match prepared.kind {
+            Kind::Operation => Mode::AsRequested,
+            _ => Mode::Call,
+        };
+        Ok(
+            match self
+                .service
+                .execute(&principal, &capability, prepared, mode, cancellation)
+                .await
+            {
+                Ok(executed) => executed_response(executed),
+                Err(error) => failure(error),
+            },
+        )
     }
 }
 
@@ -352,27 +398,34 @@ pub async fn serve_stdio(
 /// The path the network transport is served at.
 pub const MCP_PATH: &str = "/mcp";
 
-/// The MCP network transport (streamable HTTP) behind the boundary. The boundary refuses a foreign
-/// host or origin and an unauthenticated request before the SDK sees it, and the same host and
-/// origin lists are handed to the SDK's own checks, so the two cannot disagree.
-pub fn router(service: Arc<Service>, boundary: Arc<herald_boundary::Boundary>) -> axum::Router {
+/// The MCP network transport (streamable HTTP, stateless), with no boundary applied. Compose it with
+/// other routes and put the result behind [`Guarded::new`]. Serving this without the boundary leaves
+/// every call refused, since the handler takes its principal from the boundary.
+pub fn routes(service: Arc<Service>, boundary: &Boundary) -> axum::Router {
+    use herald::service::MAX_REQUEST_BYTES;
     use rmcp::transport::{
         StreamableHttpServerConfig, StreamableHttpService,
-        streamable_http_server::session::local::LocalSessionManager,
+        streamable_http_server::session::never::NeverSessionManager,
     };
     let policy = boundary.policy();
+    // The boundary is the authority on hosts and origins and runs first. The SDK's own checks get the
+    // same lists as a second layer; they are laxer (case folding, portless entries), so they only ever
+    // see requests the boundary has already admitted.
     let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_max_request_body_bytes(MAX_REQUEST_BYTES)
         .with_allowed_hosts(policy.hosts())
         .with_allowed_origins(policy.origins());
     let mcp = StreamableHttpService::new(
         move || Ok(HeraldMcp::network(service.clone())),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(NeverSessionManager::default()),
         config,
     );
-    axum::Router::new()
-        .nest_service(MCP_PATH, mcp)
-        .layer(axum::middleware::from_fn_with_state(
-            boundary,
-            herald_boundary::Boundary::guard,
-        ))
+    axum::Router::new().nest_service(MCP_PATH, mcp)
+}
+
+/// The MCP network transport behind the boundary.
+pub fn router(service: Arc<Service>, boundary: Arc<Boundary>) -> Guarded {
+    Guarded::new(routes(service, &boundary), boundary)
 }
