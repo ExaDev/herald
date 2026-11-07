@@ -9,6 +9,8 @@ use serde_json::Value;
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
+pub mod runtime;
+
 /// A future returned by an injected asynchronous port.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -50,7 +52,7 @@ pub struct Contract {
 }
 
 /// A request carries an identity reference from a trusted transport boundary. The product authorizer must verify its provenance; caller-controlled identity and confirmation fields are not proof of authentication or consent.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Request {
     pub capability: CapabilityId,
     pub identity: String,
@@ -67,7 +69,7 @@ pub enum Outcome {
 }
 
 /// Failures in registration or dispatch, separate from product outcomes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchError {
     DuplicateCapability,
     InvalidSchema(String),
@@ -89,6 +91,10 @@ pub enum DispatchError {
     OutcomeLost,
     /// The request was dropped before the product handler started.
     InterruptedBeforeDispatch,
+    /// The idempotency key was already used by this caller for a different payload.
+    KeyConflict,
+    /// The operation store failed before the handler started, so nothing ran.
+    Store(String),
 }
 
 /// Cooperative cancellation. A handler decides how cancellation affects its work.
@@ -176,6 +182,35 @@ impl Subscription {
                 .map(|()| event.clone())
                 .map_err(|e| DispatchError::InvalidEvent(e.to_string())),
         )
+    }
+}
+
+/// The decision of a [`Gate`] about a request that has passed every policy check.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Admission {
+    /// Run the handler.
+    Proceed,
+    /// Do not run the handler: return this previously recorded outcome.
+    Replay(Outcome),
+    /// Do not run the handler: refuse the request.
+    Reject(DispatchError),
+}
+
+/// A seam between policy checks and the handler, used by a durable runtime to reserve work and record its result.
+pub trait Gate: Send + Sync {
+    /// Called once per request after authorisation, confirmation and input validation, before the handler.
+    fn admit<'a>(&'a self, request: &'a Request) -> PortFuture<'a, Admission>;
+    /// Called after the handler returned a schema-valid outcome. A failure here cannot undo the handler's effects.
+    fn complete<'a>(&'a self, request: &'a Request, outcome: &'a Outcome) -> PortFuture<'a, ()>;
+}
+
+struct NoGate;
+impl Gate for NoGate {
+    fn admit<'a>(&'a self, _: &'a Request) -> PortFuture<'a, Admission> {
+        Box::pin(async { Admission::Proceed })
+    }
+    fn complete<'a>(&'a self, _: &'a Request, _: &'a Outcome) -> PortFuture<'a, ()> {
+        Box::pin(async {})
     }
 }
 
@@ -439,6 +474,16 @@ impl Dispatcher {
         request: Request,
         cancellation: Cancellation,
     ) -> Result<Outcome, DispatchError> {
+        self.dispatch_with(request, cancellation, &NoGate).await
+    }
+
+    /// As [`Dispatcher::dispatch`], but a [`Gate`] decides after policy whether the handler runs.
+    pub async fn dispatch_with(
+        &self,
+        request: Request,
+        cancellation: Cancellation,
+        gate: &dyn Gate,
+    ) -> Result<Outcome, DispatchError> {
         let mut in_flight = InFlight {
             observer: self.observer.as_ref(),
             clock: self.clock.as_ref(),
@@ -447,7 +492,7 @@ impl Dispatcher {
             started: false,
         };
         let result = self
-            .dispatch_inner(&request, cancellation, &mut in_flight)
+            .dispatch_inner(&request, cancellation, &mut in_flight, gate)
             .await;
         in_flight.completed = true;
         self.observer.finished(&request, self.clock.now(), &result);
@@ -459,6 +504,7 @@ impl Dispatcher {
         request: &Request,
         cancellation: Cancellation,
         in_flight: &mut InFlight<'_>,
+        gate: &dyn Gate,
     ) -> Result<Outcome, DispatchError> {
         let entry = self
             .entries
@@ -488,6 +534,11 @@ impl Dispatcher {
             .handler
             .as_ref()
             .ok_or(DispatchError::WrongCapabilityKind)?;
+        match gate.admit(request).await {
+            Admission::Proceed => {}
+            Admission::Replay(outcome) => return Ok(outcome),
+            Admission::Reject(error) => return Err(error),
+        }
         in_flight.started = true;
         let outcome = handler.invoke(request, cancellation).await;
         match &outcome {
@@ -500,6 +551,7 @@ impl Dispatcher {
                 .validate(value)
                 .map_err(|e| DispatchError::InvalidError(e.to_string()))?,
         }
+        gate.complete(request, &outcome).await;
         Ok(outcome)
     }
 }
