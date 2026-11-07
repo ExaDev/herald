@@ -791,6 +791,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "herald-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "herald",
+ "herald-boundary",
+ "herald-mcp",
+ "jsonschema",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "herald-mcp"
 version = "0.1.0"
 dependencies = [
