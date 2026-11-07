@@ -386,12 +386,24 @@ impl Runtime {
             .take()
             .expect("a fresh attempt has its admission signal");
         tokio::select! {
+            biased;
             signal = admitted => match signal {
                 Ok(()) => Started::Running(attempt.id),
                 // The gate ended without admitting: the attempt has finished or is about to.
-                Err(_) => Started::Finished(Self::finish(attempt).await),
+                Err(_) => Self::running_or_finished(Self::finish(attempt).await),
             },
-            submission = Self::finish_ref(&mut attempt) => Started::Finished(submission),
+            submission = Self::finish_ref(&mut attempt) => Self::running_or_finished(submission),
+        }
+    }
+
+    /// A retry of a key that is still running finishes at once with the runtime's own marker, and
+    /// which of "admitted" and "finished" is seen first is a matter of scheduling. Either way the
+    /// operation is running, so the caller is told so.
+    fn running_or_finished(submission: Submission) -> Started {
+        if submission.in_flight {
+            Started::Running(submission.id)
+        } else {
+            Started::Finished(submission)
         }
     }
 
