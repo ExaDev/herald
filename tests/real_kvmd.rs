@@ -44,6 +44,7 @@ struct Device_ {
     unauthorised: AtomicUsize,
     power_led: AtomicBool,
     mode: Mutex<Post>,
+    last_query: Mutex<String>,
 }
 type Shared = Arc<Device_>;
 
@@ -92,6 +93,7 @@ async fn switch_absent() -> impl IntoResponse {
 }
 async fn power(State(s): State<Shared>, h: HeaderMap, uri: Uri) -> impl IntoResponse {
     s.posts.fetch_add(1, Ordering::SeqCst);
+    *s.last_query.lock().unwrap() = uri.query().unwrap_or_default().to_owned();
     let mode = *s.mode.lock().unwrap();
     match mode {
         Post::Hang => std::future::pending::<()>().await,
@@ -131,6 +133,7 @@ async fn serve() -> Server {
         unauthorised: AtomicUsize::new(0),
         power_led: AtomicBool::new(false),
         mode: Mutex::new(Post::Succeed),
+        last_query: Mutex::new(String::new()),
     });
     let app = Router::new()
         .route("/api/auth/check", get(check))
@@ -478,4 +481,134 @@ async fn cancelling_a_control_the_device_never_answers_reports_unknown_after_one
         ))
     );
     assert_eq!(server.state.posts.load(Ordering::SeqCst), 1);
+}
+
+/// Version 2 of the power capability: the caller names the action, which the real client sends.
+struct PowerAction2(Arc<Kvmd>);
+impl Handler for PowerAction2 {
+    fn invoke<'a>(&'a self, request: &'a Request, _: Cancellation) -> PortFuture<'a, Outcome> {
+        Box::pin(async move {
+            let action = match request.input["action"].as_str() {
+                Some("on") => PowerAction::On,
+                Some("off") => PowerAction::Off,
+                _ => {
+                    return Outcome::Error(
+                        json!({"error": "unreachable: the schema admits only on and off"}),
+                    );
+                }
+            };
+            match self
+                .0
+                .control(Control::Power(action), Confirmation::new())
+                .await
+            {
+                Ok(_) => Outcome::Success(json!({"done": true})),
+                Err(Error::AmbiguousControl(reason)) => Outcome::Unknown(json!({"reason": reason})),
+                Err(other) => Outcome::Error(json!({"error": other.to_string()})),
+            }
+        })
+    }
+}
+
+fn versioned(name: &str, version: u32, input_schema: Value) -> Contract {
+    let mut c = contract(name, Kind::Operation, false, Support::Supported);
+    c.id = CapabilityId {
+        name: name.into(),
+        version,
+    };
+    c.input_schema = input_schema;
+    c
+}
+fn request_v(version: u32, input: Value) -> Request {
+    Request {
+        capability: CapabilityId {
+            name: "power".into(),
+            version,
+        },
+        identity: "operator".into(),
+        input,
+        confirmed: false,
+    }
+}
+
+#[tokio::test]
+async fn input_that_breaks_the_schema_never_reaches_the_device_and_versions_stay_separate() {
+    let server = serve().await;
+    let device = kvmd(&server, "test-password");
+    let policy = Policy::new(true, true);
+    let mut d = Dispatcher::new(
+        policy.clone(),
+        policy.clone(),
+        policy.clone(),
+        policy.clone(),
+    );
+    // v1 takes no input and always switches on. v2 names the action, and only on or off are valid.
+    d.register(
+        versioned(
+            "power",
+            1,
+            json!({"type":"object","additionalProperties":false}),
+        ),
+        Arc::new(PowerOn(device.clone())),
+    )
+    .unwrap();
+    d.register(
+        versioned(
+            "power",
+            2,
+            json!({"type":"object","required":["action"],"additionalProperties":false,
+                   "properties":{"action":{"enum":["on","off"]}}}),
+        ),
+        Arc::new(PowerAction2(device.clone())),
+    )
+    .unwrap();
+
+    // Each version rejects the other's input, and a value outside v2's enum is rejected, all before any request.
+    for (version, input) in [
+        (1, json!({"action": "on"})),
+        (2, json!({})),
+        (2, json!({"action": "explode"})),
+        (2, json!({"action": "on", "extra": true})),
+    ] {
+        assert!(
+            matches!(
+                d.dispatch(request_v(version, input.clone()), live()).await,
+                Err(DispatchError::InvalidInput(_))
+            ),
+            "v{version} must reject {input}"
+        );
+    }
+    assert_eq!(
+        server.state.posts.load(Ordering::SeqCst),
+        0,
+        "invalid input reached the device"
+    );
+
+    // Each version accepts its own input, and v2's action is what the real client sent.
+    assert_eq!(
+        d.dispatch(request_v(1, json!({})), live()).await,
+        Ok(Outcome::Success(json!({"observed": "matching"})))
+    );
+    assert!(
+        server
+            .state
+            .last_query
+            .lock()
+            .unwrap()
+            .contains("action=on")
+    );
+    assert_eq!(
+        d.dispatch(request_v(2, json!({"action": "off"})), live())
+            .await,
+        Ok(Outcome::Success(json!({"done": true})))
+    );
+    assert!(
+        server
+            .state
+            .last_query
+            .lock()
+            .unwrap()
+            .contains("action=off")
+    );
+    assert_eq!(server.state.posts.load(Ordering::SeqCst), 2);
 }
