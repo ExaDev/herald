@@ -915,7 +915,6 @@ async fn an_outcome_that_could_not_be_recorded_is_flagged_and_store_errors_stay_
         "the handler ran but its outcome was not stored"
     );
     // A store failure on a read reaches the client as a fixed message, never the store's own text.
-    let broken = fixture_with(false, Arc::new(MemoryOperationStore::default())).await;
     struct Failing;
     impl OperationStore for Failing {
         fn reserve<'a>(
@@ -952,7 +951,6 @@ async fn an_outcome_that_could_not_be_recorded_is_flagged_and_store_errors_stay_
         }
         fn release(&self) {}
     }
-    drop(broken);
     let failing = fixture_with(false, Arc::new(Failing)).await;
     let err = failing
         .service(all(Surface::Api))
