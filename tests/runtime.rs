@@ -15,17 +15,31 @@ use std::sync::{
 
 struct Ports {
     allow: AtomicBool,
+    /// The next authorisation panics, standing in for a failing product port.
+    panic_next: AtomicBool,
+    /// Deny any request whose input names resource "x", standing in for a per-resource policy.
+    deny_x: AtomicBool,
 }
 impl Ports {
     fn allowing() -> Arc<Self> {
         Arc::new(Self {
             allow: AtomicBool::new(true),
+            panic_next: AtomicBool::new(false),
+            deny_x: AtomicBool::new(false),
         })
     }
 }
 impl Authorizer for Ports {
-    fn authorize<'a>(&'a self, _: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
-        Box::pin(async move { self.allow.load(Ordering::SeqCst) })
+    fn authorize<'a>(&'a self, request: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            if self.panic_next.swap(false, Ordering::SeqCst) {
+                panic!("authorizer failure");
+            }
+            if self.deny_x.load(Ordering::SeqCst) && request.input["resource"] == "x" {
+                return false;
+            }
+            self.allow.load(Ordering::SeqCst)
+        })
     }
 }
 impl Confirmer for Ports {
@@ -539,12 +553,13 @@ struct Loopback(Arc<Runtime>);
 impl Transport for Loopback {
     fn submit<'a>(
         &'a self,
+        identity: String,
         envelope: SubmitEnvelope,
     ) -> PortFuture<'a, Result<Submission, TransportError>> {
         Box::pin(async move {
             let wire = serde_json::to_string(&envelope).unwrap();
             let received: SubmitEnvelope = serde_json::from_str(&wire).unwrap();
-            let reply = self.0.handle(received, live()).await;
+            let reply = self.0.handle(&identity, received, live()).await;
             Ok(serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap())
         })
     }
@@ -577,8 +592,8 @@ async fn a_remote_client_retrying_after_a_lost_reply_gets_the_same_outcome() {
         request: request("a", json!({"x": 1})),
         key: "k".into(),
     };
-    let first = remote.submit(envelope.clone()).await.unwrap();
-    let redelivered = remote.submit(envelope).await.unwrap();
+    let first = remote.submit("a".into(), envelope.clone()).await.unwrap();
+    let redelivered = remote.submit("a".into(), envelope).await.unwrap();
     assert_eq!(first, redelivered);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let events = remote.events_after("a".into(), first.id, 0).await.unwrap();
@@ -645,5 +660,267 @@ async fn a_response_that_violates_its_contract_is_recorded_as_unknown_not_left_a
         ),
         "the operation must not stay Accepted: {:?}",
         record.state()
+    );
+}
+
+/// A dispatcher whose only contract has the given error schema and handler.
+fn dispatcher_with(
+    ports: &Arc<Ports>,
+    error_schema: serde_json::Value,
+    handler: Arc<dyn Handler>,
+) -> Arc<Dispatcher> {
+    let mut d = Dispatcher::new(ports.clone(), ports.clone(), ports.clone(), ports.clone());
+    d.register(
+        Contract {
+            id: id(),
+            kind: Kind::Operation,
+            input_schema: json!({"type":"object"}),
+            output_schema: json!({"type":"object"}),
+            error_schema,
+            event_schema: json!(true),
+            required_capabilities: vec![],
+            confirmation_required: false,
+            support: Support::Supported,
+        },
+        handler,
+    )
+    .unwrap();
+    Arc::new(d)
+}
+
+#[tokio::test]
+async fn a_task_still_running_after_its_runtime_is_dropped_keeps_the_store_claimed() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let release = Arc::new(tokio::sync::Notify::new());
+    let d = dispatcher_with(
+        &ports,
+        json!({"type":"object"}),
+        Arc::new(Gated {
+            calls: calls.clone(),
+            release: release.clone(),
+        }),
+    );
+    let runtime = Runtime::open(d.clone(), store.clone()).await.unwrap().0;
+    let mut caller = Box::pin(runtime.submit(request("a", json!({})), "k".into(), live()));
+    while calls.load(Ordering::SeqCst) == 0 {
+        tokio::select! { _ = &mut caller => panic!("waits"), _ = tokio::task::yield_now() => {} }
+    }
+    drop(caller);
+    drop(runtime); // the handler is still running on its own task
+    assert!(
+        Runtime::open(d.clone(), store.clone()).await.is_err(),
+        "a new runtime must not recover work a live task is still driving"
+    );
+    release.notify_one();
+    loop {
+        if Runtime::open(d.clone(), store.clone()).await.is_ok() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let (reopened, interrupted) = Runtime::open(d, store.clone())
+        .await
+        .map_or_else(|_| (None, vec![]), |(r, i)| (Some(r), i));
+    drop(reopened);
+    assert!(
+        interrupted.is_empty(),
+        "the operation completed, so nothing is interrupted"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_before_admission_does_not_interrupt_another_live_attempt() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let release = Arc::new(tokio::sync::Notify::new());
+    let d = dispatcher_with(
+        &ports,
+        json!({"type":"object"}),
+        Arc::new(Gated {
+            calls: calls.clone(),
+            release: release.clone(),
+        }),
+    );
+    let runtime = Arc::new(Runtime::open(d, store.clone()).await.unwrap().0);
+    let first = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .submit(request("a", json!({})), "k".into(), live())
+                .await
+        })
+    };
+    while calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    // A second delivery of the same key panics in the product's authorizer before it reserves anything.
+    ports.panic_next.store(true, Ordering::SeqCst);
+    let second = runtime
+        .submit(request("a", json!({})), "k".into(), live())
+        .await;
+    assert_eq!(second.result, Err(DispatchError::OutcomeLost));
+    release.notify_one();
+    let first = first.await.unwrap();
+    assert!(matches!(first.result, Ok(Outcome::Success(_))));
+    let record = runtime.get("a", &first.id).await.unwrap().unwrap();
+    assert!(
+        matches!(record.state(), OperationState::Completed(_)),
+        "the live attempt must still complete: {:?}",
+        record.state()
+    );
+}
+
+#[tokio::test]
+async fn runtime_reported_unknown_outcomes_have_a_fixed_shape_whatever_the_error_schema() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let strict = json!({"type":"object","required":["code"]});
+    let runtime = Runtime::open(
+        dispatcher_with(
+            &ports,
+            strict.clone(),
+            Arc::new(Mutation {
+                calls: calls.clone(),
+                stall: true,
+            }),
+        ),
+        store.clone(),
+    )
+    .await
+    .unwrap()
+    .0;
+    let mut caller = Box::pin(runtime.submit(request("a", json!({})), "k".into(), live()));
+    while calls.load(Ordering::SeqCst) == 0 {
+        tokio::select! { _ = &mut caller => panic!("stalls"), _ = tokio::task::yield_now() => {} }
+    }
+    // Same key while the first attempt is in flight: the runtime says "accepted", with its own shape.
+    let in_flight = runtime
+        .submit(request("a", json!({})), "k".into(), live())
+        .await;
+    match in_flight.result {
+        Ok(Outcome::Unknown(v)) => {
+            assert_eq!(v["state"], "accepted");
+            assert!(
+                v.get("code").is_none(),
+                "not shaped by the capability's error schema"
+            );
+        }
+        other => panic!("expected the runtime's unknown outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_read_is_authorised_against_the_input_the_operation_was_submitted_with() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let runtime = open(&dispatcher(&ports, &calls, false), &store).await;
+    let on_x = runtime
+        .submit(request("a", json!({"resource": "x"})), "kx".into(), live())
+        .await;
+    let on_y = runtime
+        .submit(request("a", json!({"resource": "y"})), "ky".into(), live())
+        .await;
+    ports.deny_x.store(true, Ordering::SeqCst); // the caller is revoked from resource x only
+    assert_eq!(runtime.get("a", &on_x.id).await.unwrap(), None);
+    assert!(runtime.get("a", &on_y.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_remote_caller_cannot_submit_as_another_identity() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let runtime = Arc::new(open(&dispatcher(&ports, &calls, false), &store).await);
+    let remote = Loopback(runtime.clone());
+    // Mallory is authenticated as "mallory" but claims to be "victim" inside the envelope.
+    let forged = SubmitEnvelope {
+        request: request("victim", json!({"x": 1})),
+        key: "k".into(),
+    };
+    let reply = remote.submit("mallory".into(), forged).await.unwrap();
+    assert!(matches!(reply.result, Ok(Outcome::Success(_))));
+    // The operation belongs to mallory's scope, so the victim's key is untouched.
+    assert!(runtime.get("mallory", &reply.id).await.unwrap().is_some());
+    let victim = runtime
+        .submit(request("victim", json!({"x": 2})), "k".into(), live())
+        .await;
+    assert!(
+        matches!(victim.result, Ok(Outcome::Success(_))),
+        "no collision: {:?}",
+        victim.result
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// Delegates to a memory store but can be told to fail recovery.
+struct FailingRecover {
+    inner: MemoryOperationStore,
+    fail: AtomicBool,
+}
+impl OperationStore for FailingRecover {
+    fn reserve<'a>(
+        &'a self,
+        r: OperationRecord,
+    ) -> PortFuture<'a, Result<Reservation, StoreError>> {
+        self.inner.reserve(r)
+    }
+    fn complete<'a>(
+        &'a self,
+        id: &'a OperationId,
+        o: Outcome,
+    ) -> PortFuture<'a, Result<(), StoreError>> {
+        self.inner.complete(id, o)
+    }
+    fn get<'a>(
+        &'a self,
+        id: &'a OperationId,
+    ) -> PortFuture<'a, Result<Option<OperationRecord>, StoreError>> {
+        self.inner.get(id)
+    }
+    fn recover<'a>(&'a self) -> PortFuture<'a, Result<Vec<OperationId>, StoreError>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(StoreError("recovery failed".into())) });
+        }
+        self.inner.recover()
+    }
+    fn abandon<'a>(&'a self, id: &'a OperationId) -> PortFuture<'a, Result<(), StoreError>> {
+        self.inner.abandon(id)
+    }
+    fn acquire<'a>(&'a self) -> PortFuture<'a, Result<(), StoreError>> {
+        self.inner.acquire()
+    }
+    fn release(&self) {
+        self.inner.release()
+    }
+}
+
+#[tokio::test]
+async fn a_failed_recovery_releases_the_store_claim() {
+    let (ports, calls) = (Ports::allowing(), Arc::new(AtomicUsize::new(0)));
+    let store = Arc::new(FailingRecover {
+        inner: MemoryOperationStore::default(),
+        fail: AtomicBool::new(true),
+    });
+    let d = dispatcher(&ports, &calls, false);
+    assert!(Runtime::open(d.clone(), store.clone()).await.is_err());
+    store.fail.store(false, Ordering::SeqCst);
+    assert!(
+        Runtime::open(d, store.clone()).await.is_ok(),
+        "a failed open must not leave the store claimed"
     );
 }
