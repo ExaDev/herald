@@ -77,6 +77,10 @@ pub enum Reservation {
 pub struct StoreError(pub String);
 
 /// Product-supplied durable storage. Each method must be atomic with respect to the others.
+///
+/// A store is driven by one runtime at a time, enforced through `acquire`. `recover` treats every
+/// `Accepted` operation as abandoned, so a store shared by two live runtimes would mark running
+/// work interrupted. A persistent store should back `acquire` with an exclusive lock.
 pub trait OperationStore: Send + Sync {
     /// Reserves `(scope, key)` for the record, or reports the existing reservation or a conflict.
     fn reserve<'a>(
@@ -94,14 +98,21 @@ pub trait OperationStore: Send + Sync {
         id: &'a OperationId,
     ) -> PortFuture<'a, Result<Option<OperationRecord>, StoreError>>;
     /// Appends `Interrupted` to every operation still `Accepted` and returns their identifiers.
-    /// Called when a runtime opens, because no other runtime is then driving them.
+    /// Called when a runtime opens, after `acquire`, because no other runtime is then driving them.
     fn recover<'a>(&'a self) -> PortFuture<'a, Result<Vec<OperationId>, StoreError>>;
+    /// Appends `Interrupted` to one operation if it is still `Accepted`, for a handler that panicked.
+    fn abandon<'a>(&'a self, id: &'a OperationId) -> PortFuture<'a, Result<(), StoreError>>;
+    /// Claims exclusive use of the store for one runtime. Fails while another runtime holds it.
+    fn acquire<'a>(&'a self) -> PortFuture<'a, Result<(), StoreError>>;
+    /// Releases the claim. Called when the owning runtime is dropped.
+    fn release(&self);
 }
 
 /// An in-memory store for tests and embedded hosts that need no persistence across process loss.
 #[derive(Default)]
 pub struct MemoryOperationStore {
     records: Mutex<Vec<OperationRecord>>,
+    owned: Mutex<bool>,
 }
 
 impl OperationStore for MemoryOperationStore {
@@ -159,6 +170,38 @@ impl OperationStore for MemoryOperationStore {
         })
     }
 
+    fn abandon<'a>(&'a self, id: &'a OperationId) -> PortFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut records = self.records.lock().expect("store lock is never poisoned");
+            if let Some(record) = records
+                .iter_mut()
+                .find(|r| &r.id == id && r.state() == &OperationState::Accepted)
+            {
+                let seq = record.events.len() as u64;
+                record.events.push(OperationEvent {
+                    seq,
+                    state: OperationState::Interrupted,
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn acquire<'a>(&'a self) -> PortFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut owned = self.owned.lock().expect("owner lock is never poisoned");
+            if *owned {
+                return Err(StoreError("the store is held by another runtime".into()));
+            }
+            *owned = true;
+            Ok(())
+        })
+    }
+
+    fn release(&self) {
+        *self.owned.lock().expect("owner lock is never poisoned") = false;
+    }
+
     fn recover<'a>(&'a self) -> PortFuture<'a, Result<Vec<OperationId>, StoreError>> {
         Box::pin(async move {
             let mut records = self.records.lock().expect("store lock is never poisoned");
@@ -207,8 +250,10 @@ pub trait Transport: Send + Sync {
         &'a self,
         envelope: SubmitEnvelope,
     ) -> PortFuture<'a, Result<Submission, TransportError>>;
+    /// `identity` is the caller the transport authenticated; a runtime only returns that caller's operations.
     fn events_after<'a>(
         &'a self,
+        identity: String,
         id: OperationId,
         cursor: u64,
     ) -> PortFuture<'a, Result<Vec<OperationEvent>, TransportError>>;
@@ -222,17 +267,25 @@ pub struct Runtime {
 
 impl Runtime {
     /// Opens a runtime over a store and marks operations a previous runtime left `Accepted` as `Interrupted`.
-    /// Returns the runtime and the identifiers that were interrupted.
+    /// Returns the runtime and the identifiers that were interrupted. Fails if another runtime holds the store.
     pub async fn open(
         dispatcher: Arc<Dispatcher>,
         store: Arc<dyn OperationStore>,
     ) -> Result<(Self, Vec<OperationId>), StoreError> {
-        let interrupted = store.recover().await?;
-        Ok((Self { dispatcher, store }, interrupted))
+        store.acquire().await?;
+        let runtime = Self { dispatcher, store };
+        // On failure the runtime drops here and releases the claim.
+        let interrupted = runtime.store.recover().await?;
+        Ok((runtime, interrupted))
     }
 
     /// Runs the request once per `(identity, key)`. Policy runs on every call, so a retry needs a fresh
     /// authorisation; only then is the recorded outcome returned without running the handler.
+    ///
+    /// The runtime owns the operation: the handler runs on its own task, so dropping this future does
+    /// not abandon it and its outcome is still recorded. Keys share one namespace per identity, so
+    /// reusing a key for another capability or input is a `KeyConflict`. Confirmation is evaluated on
+    /// every delivery and is not part of the operation's identity.
     pub async fn submit(
         &self,
         request: Request,
@@ -241,33 +294,47 @@ impl Runtime {
     ) -> Submission {
         let scope = request.identity.clone();
         let id = operation_id(&scope, &key);
-        let gate = RuntimeGate {
-            store: self.store.as_ref(),
-            record: OperationRecord {
-                id: id.clone(),
-                scope,
-                key,
-                digest: digest(&request),
-                capability: request.capability.clone(),
-                events: vec![OperationEvent {
-                    seq: 0,
-                    state: OperationState::Accepted,
-                }],
-            },
-            record_error: Mutex::new(None),
+        let record = OperationRecord {
+            id: id.clone(),
+            scope,
+            key,
+            digest: digest(&request),
+            capability: request.capability.clone(),
+            events: vec![OperationEvent {
+                seq: 0,
+                state: OperationState::Accepted,
+            }],
         };
-        let result = self
-            .dispatcher
-            .dispatch_with(request, cancellation, &gate)
-            .await;
-        let record_error = gate
-            .record_error
-            .into_inner()
-            .expect("error lock is never poisoned");
-        Submission {
-            id,
-            result,
-            record_error,
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let store = Arc::clone(&self.store);
+        let task = tokio::spawn(async move {
+            let gate = RuntimeGate {
+                store: store.as_ref(),
+                record,
+                record_error: Mutex::new(None),
+            };
+            let result = dispatcher.dispatch_with(request, cancellation, &gate).await;
+            let record_error = gate
+                .record_error
+                .into_inner()
+                .expect("error lock is never poisoned");
+            (result, record_error)
+        });
+        match task.await {
+            Ok((result, record_error)) => Submission {
+                id,
+                result,
+                record_error,
+            },
+            Err(_) => {
+                // The handler panicked after it may have run, so the outcome is unknown.
+                let record_error = self.store.abandon(&id).await.err();
+                Submission {
+                    id,
+                    result: Err(DispatchError::OutcomeLost),
+                    record_error,
+                }
+            }
         }
     }
 
@@ -277,20 +344,39 @@ impl Runtime {
             .await
     }
 
-    pub async fn get(&self, id: &OperationId) -> Result<Option<OperationRecord>, StoreError> {
-        self.store.get(id).await
+    /// The operation, only if `identity` created it and the product's authorizer still admits that
+    /// identity for the operation's capability. Anything else reads as absent, so neither another
+    /// caller's outcome nor its existence leaks.
+    pub async fn get(
+        &self,
+        identity: &str,
+        id: &OperationId,
+    ) -> Result<Option<OperationRecord>, StoreError> {
+        let Some(record) = self.store.get(id).await? else {
+            return Ok(None);
+        };
+        if record.scope != identity {
+            return Ok(None);
+        }
+        let probe = Request {
+            capability: record.capability.clone(),
+            identity: identity.to_owned(),
+            input: Value::Null,
+            confirmed: false,
+        };
+        Ok(self.dispatcher.authorise(&probe).await.then_some(record))
     }
 
     /// Events from `cursor` onward, where the cursor is the number of events the client has already seen.
     /// A client reconnects with the cursor it last held and misses nothing; each client reads at its own pace.
     pub async fn events_after(
         &self,
+        identity: &str,
         id: &OperationId,
         cursor: u64,
     ) -> Result<Vec<OperationEvent>, StoreError> {
         let record = self
-            .store
-            .get(id)
+            .get(identity, id)
             .await?
             .ok_or_else(|| StoreError("operation not found".into()))?;
         Ok(record
@@ -298,6 +384,12 @@ impl Runtime {
             .into_iter()
             .filter(|e| e.seq >= cursor)
             .collect())
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.store.release();
     }
 }
 
@@ -341,16 +433,50 @@ impl Gate for RuntimeGate<'_> {
 
 fn operation_id(scope: &str, key: &str) -> OperationId {
     let mut hasher = Sha256::new();
-    hasher.update(scope.len().to_be_bytes());
+    hasher.update((scope.len() as u64).to_be_bytes());
     hasher.update(scope.as_bytes());
     hasher.update(key.as_bytes());
     OperationId(format!("op-{}", hex(&hasher.finalize())))
 }
 
-/// `serde_json` keeps object keys sorted, so equal payloads serialise to equal bytes.
+/// Hashes the capability and input as canonical text: object keys sorted, no whitespace. Numbers keep
+/// the form they were written in, so `1` and `1.0` are different payloads.
 fn digest(request: &Request) -> String {
-    let canonical: Value = json!([request.capability, request.input]);
-    hex(&Sha256::digest(canonical.to_string().as_bytes()))
+    let mut text = String::new();
+    canonical(&json!(request.capability), &mut text);
+    text.push('|');
+    canonical(&request.input, &mut text);
+    hex(&Sha256::digest(text.as_bytes()))
+}
+
+fn canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

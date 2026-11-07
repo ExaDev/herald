@@ -5,7 +5,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
@@ -365,6 +365,14 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Whether the product's authorizer admits `request` for its registered capability. It checks nothing else.
+    pub async fn authorise(&self, request: &Request) -> bool {
+        match self.entries.get(&request.capability) {
+            Some(entry) => self.authorizer.authorize(request, &entry.contract).await,
+            None => false,
+        }
+    }
+
     /// Returns registered contracts. Exposure policy must be applied by the caller.
     pub fn contracts(&self) -> impl Iterator<Item = &Contract> {
         self.entries.values().map(|entry| &entry.contract)
@@ -541,15 +549,22 @@ impl Dispatcher {
         }
         in_flight.started = true;
         let outcome = handler.invoke(request, cancellation).await;
-        match &outcome {
+        let checked = match &outcome {
             Outcome::Success(value) => entry
                 .output
                 .validate(value)
-                .map_err(|e| DispatchError::InvalidOutput(e.to_string()))?,
+                .map_err(|e| DispatchError::InvalidOutput(e.to_string())),
             Outcome::Error(value) | Outcome::Unknown(value) => entry
                 .error
                 .validate(value)
-                .map_err(|e| DispatchError::InvalidError(e.to_string()))?,
+                .map_err(|e| DispatchError::InvalidError(e.to_string())),
+        };
+        if let Err(violation) = checked {
+            // The handler ran, so its effects are unknown: record that instead of leaving the operation accepted.
+            let unknown =
+                Outcome::Unknown(json!({"reason": "the handler's response violated its contract"}));
+            gate.complete(request, &unknown).await;
+            return Err(violation);
         }
         gate.complete(request, &outcome).await;
         Ok(outcome)
