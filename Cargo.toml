@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/herald-boundary", "crates/herald-mcp"]
+members = [".", "crates/herald-boundary", "crates/herald-mcp", "crates/herald-http"]
 resolver = "3"
 
 [package]

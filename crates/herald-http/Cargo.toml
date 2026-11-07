@@ -1,0 +1,18 @@
+[package]
+name = "herald-http"
+version = "0.1.0"
+edition = "2024"
+description = "Exposes Herald capabilities as a versioned JSON API with a generated client contract"
+
+[dependencies]
+axum = "0.8"
+herald = { path = "../.." }
+herald-boundary = { path = "../herald-boundary" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+jsonschema = { version = "0.60.2", default-features = false }
+herald-mcp = { path = "../herald-mcp" }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

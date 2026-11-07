@@ -1,6 +1,6 @@
 # Herald
 
-Herald is a product-neutral framework for declaring application capabilities once and exposing them through multiple interfaces. The in-process Rust registry and dispatcher are under development; remote runtimes and interface adapters described below remain design goals.
+Herald is a product-neutral framework for declaring application capabilities once and exposing them through multiple interfaces. The in-process Rust registry, dispatcher, durable runtime and protocol-free service are implemented, with MCP and HTTP API adapters, whose network transports sit behind an authenticating boundary; command-line, terminal and graphical adapters and remote runtimes described below remain design goals.
 
 ## Purpose
 
@@ -8,7 +8,7 @@ Applications own their operations, business rules, permissions and user workflow
 
 ## Architecture
 
-A product registers versioned operations, queries and subscriptions with input, output, error and event schemas, semantic metadata and handlers. The in-process dispatcher validates and routes requests through product-supplied authorisation, confirmation, clock and observability ports. Identity and confirmation claims require verification by those product-supplied ports; a caller-provided value is not proof. Future adapters will translate the same contracts into interfaces, while product policy stays in the product.
+A product registers versioned operations, queries and subscriptions with input, output, error and event schemas, semantic metadata and handlers. The in-process dispatcher validates and routes requests through product-supplied authorisation, confirmation, clock and observability ports. Identity and confirmation claims require verification by those product-supplied ports; a caller-provided value is not proof. The `service` module is the protocol-free layer every adapter calls. The `herald-mcp` and `herald-http` crates translate the same contracts into MCP tools and a versioned JSON API with a generated client contract, and `herald-boundary` authenticates callers and enforces host and origin policy at the edge of the network adapters. Further adapters will do the same, while product policy stays in the product.
 
 The intended runtime supports in-process composition and remote invocation through transport contracts, with persistence supplied through an asynchronous storage contract. The in-process dispatcher alone records nothing. The `runtime` module adds durable operations in front of it: caller-scoped idempotency keys map to stable operation IDs, a retry with fresh authorisation replays the recorded outcome without running the handler, a key reused for another payload is rejected, an operation accepted but never completed reads as unknown after a restart, and clients follow an operation's events from their own cursor. Storage is a product-supplied port that declares how many records one caller may hold and for how long a finished record is kept, and a runtime opened with a running limit refuses a store that declares neither. A transport carries serialisable envelopes. Cancellation is cooperative; a lost outcome must not be treated as an automatic failure or a safe retry.
 
