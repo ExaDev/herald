@@ -261,8 +261,8 @@ pub struct Submission {
     /// Set when the handler ran but its outcome could not be recorded. The record stays `Accepted`
     /// and reads as `Interrupted` after the next recovery.
     pub record_error: Option<StoreError>,
-    /// True when this delivery found the same key still running. The result is then the runtime's own
-    /// unknown outcome, not the operation's, and the operation is still in progress.
+    /// True when this delivery found the same key still running in this runtime. The result is then
+    /// the runtime's own unknown outcome, not the operation's, and the operation is still in progress.
     #[serde(default)]
     pub in_flight: bool,
 }
@@ -321,6 +321,33 @@ pub struct Runtime {
     store: Arc<dyn OperationStore>,
     lease: Arc<Lease>,
     tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// How many attempts of each operation are running in this runtime, itself included. A record
+    /// that reads `Accepted` with no other attempt running was left so by a failed write, not by a
+    /// handler still at work.
+    live: Arc<Mutex<std::collections::HashMap<OperationId, usize>>>,
+}
+
+/// Counts an attempt in `live` while it exists, and aborts the inner handler task when the
+/// supervising task is dropped, so stopping the supervisor stops the handler with it.
+struct AttemptGuard {
+    id: OperationId,
+    live: Arc<Mutex<std::collections::HashMap<OperationId, usize>>>,
+    inner: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = &self.inner {
+            inner.abort();
+        }
+        let mut live = self.live.lock().expect("live lock is never poisoned");
+        if let Some(count) = live.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                live.remove(&self.id);
+            }
+        }
+    }
 }
 
 /// Holds the store claim until the runtime and every task it spawned are gone, so a new runtime
@@ -346,6 +373,7 @@ impl Runtime {
             lease: Arc::new(Lease(Arc::clone(&store))),
             store,
             tasks: Arc::new(Mutex::new(Vec::new())),
+            live: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
         // On failure the runtime drops here and its lease releases the claim.
         let interrupted = runtime.store.recover().await?;
@@ -425,25 +453,40 @@ impl Runtime {
         let dispatcher = Arc::clone(&self.dispatcher);
         let store = Arc::clone(&self.store);
         let lease = Arc::clone(&self.lease);
-        let tasks = Arc::clone(&self.tasks);
+        let live = Arc::clone(&self.live);
+        *live
+            .lock()
+            .expect("live lock is never poisoned")
+            .entry(id.clone())
+            .or_default() += 1;
         let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
         let attempt_id = id.clone();
         // The outer task owns the lease and the attempt's bookkeeping, so everything below happens even
         // if the caller drops its future: a panic in the handler is recorded, and the lease is released
         // only after the record has been marked.
         let task = tokio::spawn(async move {
-            let _lease = lease;
+            let _lease = Arc::clone(&lease);
+            let mut guard = AttemptGuard {
+                id: attempt_id.clone(),
+                live: Arc::clone(&live),
+                inner: None,
+            };
             let reserved = Arc::new(AtomicBool::new(false));
             let in_flight = Arc::new(AtomicBool::new(false));
             let inner = {
                 let reserved = Arc::clone(&reserved);
                 let in_flight = Arc::clone(&in_flight);
                 let store = Arc::clone(&store);
+                let live = Arc::clone(&live);
                 tokio::spawn(async move {
+                    // The handler task holds the claim too, so the store stays owned for as long as
+                    // the handler can still write to it.
+                    let _lease = lease;
                     let gate = RuntimeGate {
                         store: store.as_ref(),
                         record,
                         reserved,
+                        live,
                         in_flight,
                         admitted: Mutex::new(Some(admit_tx)),
                         record_error: Mutex::new(None),
@@ -456,10 +499,7 @@ impl Runtime {
                     (result, record_error)
                 })
             };
-            tasks
-                .lock()
-                .expect("task lock is never poisoned")
-                .push(inner.abort_handle());
+            guard.inner = Some(inner.abort_handle());
             match inner.await {
                 Ok((result, record_error)) => Submission {
                     id: attempt_id,
@@ -601,6 +641,9 @@ struct RuntimeGate<'a> {
     record: OperationRecord,
     /// Set once this attempt holds the reservation.
     reserved: Arc<AtomicBool>,
+    /// Attempts running in this runtime, to tell a running operation from one a failed write left
+    /// `Accepted`.
+    live: Arc<Mutex<std::collections::HashMap<OperationId, usize>>>,
     /// Set when the key was found already running.
     in_flight: Arc<AtomicBool>,
     /// Fired when the reservation is held and the handler is about to run, so `start` can return early.
@@ -609,6 +652,16 @@ struct RuntimeGate<'a> {
 }
 
 impl RuntimeGate<'_> {
+    /// Whether an attempt other than this one is running the operation. This attempt is counted, so
+    /// another exists only when the count is above one.
+    fn another_attempt_is_live(&self, id: &OperationId) -> bool {
+        self.live
+            .lock()
+            .expect("live lock is never poisoned")
+            .get(id)
+            .is_some_and(|count| *count > 1)
+    }
+
     fn signal_admitted(&self) {
         if let Some(sender) = self
             .admitted
@@ -640,13 +693,18 @@ impl Gate for RuntimeGate<'_> {
                 Ok(Reservation::Conflict) => Admission::Reject(DispatchError::KeyConflict),
                 Ok(Reservation::Existing(existing)) => match existing.state() {
                     OperationState::Completed(outcome) => Admission::Replay(outcome.clone()),
-                    OperationState::Accepted => {
+                    OperationState::Accepted if self.another_attempt_is_live(&existing.id) => {
                         self.in_flight.store(true, Ordering::SeqCst);
                         self.signal_admitted();
                         Admission::Replay(Outcome::Unknown(
                             json!({"source": "runtime", "operation": existing.id.0, "state": "accepted"}),
                         ))
                     }
+                    // No attempt is running, so a write that should have ended the record failed and
+                    // the handler is gone: the operation reads as interrupted, as it will after a restart.
+                    OperationState::Accepted => Admission::Replay(Outcome::Unknown(
+                        json!({"source": "runtime", "operation": existing.id.0, "state": "interrupted"}),
+                    )),
                     OperationState::Interrupted => Admission::Replay(Outcome::Unknown(
                         json!({"source": "runtime", "operation": existing.id.0, "state": "interrupted"}),
                     )),
