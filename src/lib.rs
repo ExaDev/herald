@@ -561,8 +561,9 @@ impl Dispatcher {
         };
         if let Err(violation) = checked {
             // The handler ran, so its effects are unknown: record that instead of leaving the operation accepted.
-            let unknown =
-                Outcome::Unknown(json!({"reason": "the handler's response violated its contract"}));
+            let unknown = Outcome::Unknown(
+                json!({"source": "runtime", "reason": "the handler's response violated its contract"}),
+            );
             gate.complete(request, &unknown).await;
             return Err(violation);
         }

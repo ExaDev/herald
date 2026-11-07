@@ -7,7 +7,8 @@
 //! port, so the same runtime sits on memory, a file or a database without the dispatcher knowing.
 //!
 //! An `Unknown` outcome the runtime reports itself (an operation still accepted, interrupted, or a
-//! handler response that broke its contract) has a fixed shape and is not checked against the
+//! handler response that broke its contract) carries `"source": "runtime"`, which a handler's own
+//! `Unknown` need not, and has a fixed shape and is not checked against the
 //! capability's error schema, which describes what handlers return. The runtime needs `tokio`: each
 //! handler runs on a spawned task.
 //!
@@ -56,6 +57,7 @@ pub struct OperationRecord {
     pub digest: String,
     pub capability: CapabilityId,
     /// The submitted input, kept so a read is authorised against the same resource the submission was.
+    /// It is stored at rest and may carry secrets, so a store must protect it like the caller's data.
     pub input: Value,
     pub events: Vec<OperationEvent>,
 }
@@ -112,6 +114,7 @@ pub struct StoreError(pub String);
 /// work interrupted. A persistent store should back `acquire` with an exclusive lock.
 pub trait OperationStore: Send + Sync {
     /// Reserves `(scope, key)` for the record, or reports the existing reservation or a conflict.
+    /// It must not persist the record when it returns an error, because nothing runs after a failed reservation.
     fn reserve<'a>(
         &'a self,
         record: OperationRecord,
@@ -297,6 +300,7 @@ pub struct Runtime {
     dispatcher: Arc<Dispatcher>,
     store: Arc<dyn OperationStore>,
     lease: Arc<Lease>,
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 /// Holds the store claim until the runtime and every task it spawned are gone, so a new runtime
@@ -321,6 +325,7 @@ impl Runtime {
             dispatcher,
             lease: Arc::new(Lease(Arc::clone(&store))),
             store,
+            tasks: Mutex::new(Vec::new()),
         };
         // On failure the runtime drops here and its lease releases the claim.
         let interrupted = runtime.store.recover().await?;
@@ -374,6 +379,11 @@ impl Runtime {
                 .expect("error lock is never poisoned");
             (result, record_error)
         });
+        {
+            let mut tasks = self.tasks.lock().expect("task lock is never poisoned");
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task.abort_handle());
+        }
         match task.await {
             Ok((result, record_error)) => Submission {
                 id,
@@ -394,6 +404,24 @@ impl Runtime {
                     record_error,
                 }
             }
+        }
+    }
+
+    /// Stops every running handler and releases the store. Operations that were still running stay
+    /// `Accepted` and read as `Interrupted` once the next runtime opens the store. A handler that
+    /// never completes would otherwise keep the store claimed for the life of the process.
+    pub async fn shutdown(self) {
+        for task in self
+            .tasks
+            .lock()
+            .expect("task lock is never poisoned")
+            .iter()
+        {
+            task.abort();
+        }
+        // Each aborted task drops its lease clone when the scheduler next polls it.
+        while Arc::strong_count(&self.lease) > 1 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -482,10 +510,10 @@ impl Gate for RuntimeGate<'_> {
                 Ok(Reservation::Existing(existing)) => match existing.state() {
                     OperationState::Completed(outcome) => Admission::Replay(outcome.clone()),
                     OperationState::Accepted => Admission::Replay(Outcome::Unknown(
-                        json!({"operation": existing.id.0, "state": "accepted"}),
+                        json!({"source": "runtime", "operation": existing.id.0, "state": "accepted"}),
                     )),
                     OperationState::Interrupted => Admission::Replay(Outcome::Unknown(
-                        json!({"operation": existing.id.0, "state": "interrupted"}),
+                        json!({"source": "runtime", "operation": existing.id.0, "state": "interrupted"}),
                     )),
                 },
                 Err(error) => Admission::Reject(DispatchError::Store(error.0)),
