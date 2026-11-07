@@ -1,7 +1,6 @@
-//! Product-neutral capability contracts and in-process dispatch.
+//! Product-neutral capability contracts, in-process dispatch, durable operations, and the protocol-free service that network adapters call.
 //!
-//! Products supply handlers and policy. Herald never retries a handler after an
-//! ambiguous outcome and does not turn cancellation into proof of rollback.
+//! Products supply handlers and policy. Herald never retries a handler after an ambiguous outcome and does not turn cancellation into proof of rollback.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,7 +8,12 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
+pub mod contract_schema;
+pub mod exposure;
 pub mod runtime;
+pub mod schema_refs;
+pub mod service;
+pub mod wire;
 
 /// A future returned by an injected asynchronous port.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -51,12 +55,13 @@ pub struct Contract {
     pub support: Support,
 }
 
-/// A request carries an identity reference from a trusted transport boundary. The product authorizer must verify its provenance; caller-controlled identity and confirmation fields are not proof of authentication or consent.
+/// A request carries an identity reference from a trusted transport boundary. The product authoriser must verify its provenance; caller-controlled identity and confirmation fields are not proof of authentication or consent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Request {
     pub capability: CapabilityId,
     pub identity: String,
     pub input: Value,
+    /// Whether the transport claims the caller consented. The service never sets it from the wire (it is always false there), so a product's [`Confirmer`] is the only authority on consent. The confirmer runs before an idempotent replay is served, so replaying a completed operation that requires confirmation asks the confirmer again and must be answerable more than once.
     pub confirmed: bool,
 }
 
@@ -73,6 +78,8 @@ pub enum Outcome {
 pub enum DispatchError {
     DuplicateCapability,
     InvalidSchema(String),
+    /// A capability name that adapters could not address safely.
+    InvalidName(String),
     NotFound,
     Denied,
     Unsupported,
@@ -87,7 +94,7 @@ pub enum DispatchError {
     WrongCapabilityKind,
     InvalidEvent(String),
     SubscriptionSource(Value),
-    /// The caller dropped an in-flight handler; its side effects are unknown.
+    /// A handler's side effects are unknown: it was dropped in flight, panicked, was stopped at its run ceiling or was lost with the task supervising it.
     OutcomeLost,
     /// The request was dropped before the product handler started.
     InterruptedBeforeDispatch,
@@ -95,21 +102,39 @@ pub enum DispatchError {
     KeyConflict,
     /// The operation store failed before the handler started, so nothing ran.
     Store(String),
+    /// The runtime is running as many operations as it is limited to, so nothing was stored or run.
+    Unavailable,
+    /// A query ran past the runtime's ceiling and was stopped. A query has no side effects, so nothing is unknown.
+    TimedOut,
 }
 
 /// Cooperative cancellation. A handler decides how cancellation affects its work.
 #[derive(Clone)]
 pub struct Cancellation {
     receiver: watch::Receiver<bool>,
+    /// Things the requester needs kept alive for as long as the handler runs.
+    holds: Vec<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Creates a cancellation handle and its associated signal.
 pub fn cancellation() -> (watch::Sender<bool>, Cancellation) {
     let (sender, receiver) = watch::channel(false);
-    (sender, Cancellation { receiver })
+    (
+        sender,
+        Cancellation {
+            receiver,
+            holds: Vec::new(),
+        },
+    )
 }
 
 impl Cancellation {
+    /// Keeps `hold` alive until the dispatch is done: the handler's future and the checks and record write that follow it. The dispatcher keeps a clone of this cancellation for that long, whether or not the handler holds on to the one it is given, so this is how a requester keeps a resource, such as an admission slot, for as long as the handler runs even after the requester has gone away. A handler that moves its own clone somewhere long-lived keeps the hold for as long as it keeps the clone. Holds add up: each call keeps another.
+    pub fn with_hold<T: std::any::Any + Send + Sync>(mut self, hold: T) -> Self {
+        self.holds.push(Arc::new(hold));
+        self
+    }
+
     /// Returns whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         *self.receiver.borrow()
@@ -219,11 +244,51 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> u64;
 }
 
-/// Product-owned observer receives dispatch outcomes and timestamps.
+/// Product-owned observer receives dispatch outcomes and timestamps. A capability call a service refuses for lack of authorisation is reported here as a denial before its input has been validated, whichever adapter it came in by, so an observer that keeps requests should bound what it keeps, and an authoriser should be cheap, since a caller who is refused can repeat the request.
 pub trait Observer: Send + Sync {
     fn finished(&self, request: &Request, at: u64, result: &Result<Outcome, DispatchError>);
     /// Records whether a subscription was opened or denied.
     fn subscription_opened(&self, request: &Request, at: u64, result: &Result<(), DispatchError>);
+}
+
+/// The prefix adapters use for their own follow-up tools, so no capability may take it.
+pub const RESERVED_PREFIX: &str = "herald.";
+
+/// The longest tool name used. The official Rust SDK validates tool names up to 128 characters, citing the tool-name format proposal, and 64 is a deliberately conservative bound below that, so that clients that enforce a shorter limit still accept every tool. An MCP tool is `<name>.v<version>`, so a capability's name must leave room for that suffix.
+const MAX_TOOL_NAME_BYTES: usize = 64;
+
+/// The longest capability name: the tool-name bound less `.v` and the widest `u32` version.
+pub const MAX_NAME_BYTES: usize = MAX_TOOL_NAME_BYTES - ".v4294967295".len();
+
+/// A name is addressable on every surface: ASCII letters, digits, `_`, `-` and `.`, starting with a letter or digit (so it is never a path segment such as `..`), not reserved, and not ending in `.v<digits>`, which adapters read as a version suffix.
+fn validate_name(name: &str) -> Result<(), DispatchError> {
+    let bad = |reason: &str| Err(DispatchError::InvalidName(format!("{name:?}: {reason}")));
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return bad("too long to be an MCP tool name with a version suffix");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return bad("only ASCII letters, digits, '_', '-' and '.' are allowed");
+    }
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return bad("a name starts with a letter or a digit");
+    }
+    // `herald` itself is excluded too: its tool name, `herald.v1`, is inside the reserved prefix.
+    if name == RESERVED_PREFIX.trim_end_matches('.') || name.starts_with(RESERVED_PREFIX) {
+        return bad("the 'herald' name and the 'herald.' prefix are reserved");
+    }
+    if let Some((_, suffix)) = name.rsplit_once(".v")
+        && !suffix.is_empty()
+        && suffix.bytes().all(|b| b.is_ascii_digit())
+    {
+        return bad("a trailing '.v<digits>' reads as a version");
+    }
+    Ok(())
 }
 
 struct InFlight<'a> {
@@ -339,10 +404,12 @@ impl Dispatcher {
         handler: Option<Arc<dyn Handler>>,
         subscription: Option<Arc<dyn SubscriptionHandler>>,
     ) -> Result<(), DispatchError> {
+        validate_name(&contract.id.name)?;
         if self.entries.contains_key(&contract.id) {
             return Err(DispatchError::DuplicateCapability);
         }
         let compile = |schema: &Value| {
+            crate::schema_refs::check_publishable(schema).map_err(DispatchError::InvalidSchema)?;
             jsonschema::validator_for(schema)
                 .map_err(|e| DispatchError::InvalidSchema(e.to_string()))
         };
@@ -365,12 +432,24 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Whether the product's authorizer admits `request` for its registered capability. It checks nothing else.
+    /// Whether the product's authoriser admits `request` for its registered capability. It checks nothing else.
     pub async fn authorise(&self, request: &Request) -> bool {
         match self.entries.get(&request.capability) {
             Some(entry) => self.authorizer.authorize(request, &entry.contract).await,
             None => false,
         }
+    }
+
+    /// As [`Dispatcher::authorise`], and reports a refusal to the observer as `Denied`, the same record in-process dispatch leaves, so a remote caller's denied calls are audited too. Reading an operation, or listing capabilities, authorises through the unaudited path and leaves no such record. An unknown capability is not reported: there is no contract to deny.
+    pub async fn authorise_audited(&self, request: &Request) -> Result<(), DispatchError> {
+        if self.authorise(request).await {
+            return Ok(());
+        }
+        if self.entries.contains_key(&request.capability) {
+            self.observer
+                .finished(request, self.clock.now(), &Err(DispatchError::Denied));
+        }
+        Err(DispatchError::Denied)
     }
 
     /// Returns registered contracts. Exposure policy must be applied by the caller.
@@ -548,6 +627,8 @@ impl Dispatcher {
             Admission::Reject(error) => return Err(error),
         }
         in_flight.started = true;
+        // The holds a requester attached to the cancellation stay with this call until the handler's future is done, whether or not the handler keeps the cancellation it was given: a handler that ignores that argument drops it as `invoke` returns, before its future runs.
+        let _holds = cancellation.clone();
         let outcome = handler.invoke(request, cancellation).await;
         let checked = match &outcome {
             Outcome::Success(value) => entry

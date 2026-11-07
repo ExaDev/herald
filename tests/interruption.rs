@@ -148,3 +148,31 @@ async fn dropping_a_started_handler_reports_unknown_outcome() {
         vec![Err(DispatchError::OutcomeLost)]
     );
 }
+
+#[test]
+fn a_hold_outlives_the_requester_and_goes_when_the_last_clone_does() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Marker(Arc<AtomicBool>);
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let (first, second) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (sender, cancellation) = herald::cancellation();
+    let cancellation = cancellation
+        .with_hold(Marker(first.clone()))
+        .with_hold(Marker(second.clone()));
+    let handler_side = cancellation.clone();
+    drop(cancellation);
+    drop(sender);
+    assert!(
+        !first.load(Ordering::SeqCst) && !second.load(Ordering::SeqCst),
+        "the requester is gone but the handler still holds both"
+    );
+    drop(handler_side);
+    assert!(first.load(Ordering::SeqCst) && second.load(Ordering::SeqCst));
+}
