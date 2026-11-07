@@ -6,6 +6,11 @@
 //! This crate defines the hooks. Credentials, tokens and how they are verified belong to the product,
 //! which supplies an [`Authenticator`].
 //!
+//! The boundary also bounds its own load: each request has a deadline and the number in flight is
+//! capped ([`Limits`]), so a slow or numerous caller cannot hold the server open. What it does not
+//! bound is how long a connection may take to send its request headers, which is a setting of the
+//! server that accepts connections, not of the router.
+//!
 //! The boundary serves programmatic clients that send a credential header. Browser clients on another
 //! origin also need CORS preflight answers, which this crate does not provide: a product that wants
 //! them adds a CORS layer in front, answering only for origins in its [`OriginPolicy`]. The policy
@@ -14,7 +19,7 @@
 use axum::{
     Json, Router,
     extract::{FromRequestParts, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts, uri::Authority},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::IntoMakeService,
@@ -25,7 +30,25 @@ use herald::{
     wire::{ErrorCode, WireError},
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
+
+/// What an [`Authenticator`] decided about a request's credentials.
+pub enum Authentication {
+    /// The credentials name this caller.
+    Authenticated(Principal),
+    /// The credentials are missing or wrong.
+    Rejected,
+    /// The credentials could not be checked, because the product's own backend failed. The caller is
+    /// told to retry, which is not the same as being told its credentials are wrong.
+    Unavailable,
+}
+
+impl From<Option<Principal>> for Authentication {
+    fn from(principal: Option<Principal>) -> Self {
+        principal.map_or(Self::Rejected, Self::Authenticated)
+    }
+}
 
 /// Verifies a request's credentials and names the caller. The product implements it.
 ///
@@ -33,15 +56,25 @@ use std::{collections::BTreeSet, sync::Arc};
 /// secrets in constant time. It must read a credential from a header the browser does not attach on
 /// its own, such as `Authorization`, and must not accept cookies: a request with no `Origin` is
 /// admitted as a non-browser client, which is only safe if the credential cannot ride along ambiently.
+/// A request that repeats `Authorization` is refused before it gets here.
+///
+/// A [`Principal`]'s identity is the key for operation ownership and idempotency scope, so an
+/// authenticator that accepts more than one kind of credential or issuer must give identities that
+/// cannot collide across them, for example by prefixing the issuer.
 pub trait Authenticator: Send + Sync {
-    /// The authenticated caller, or `None` when the credentials are missing or wrong. It must not
-    /// trust a header that merely claims an identity.
-    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Option<Principal>>;
+    /// The authenticated caller. It must not trust a header that merely claims an identity.
+    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication>;
 
     /// The OpenAPI security scheme clients use, advertised in the generated contract. Defaults to a
     /// bearer token.
     fn security_scheme(&self) -> Value {
         json!({"type": "http", "scheme": "bearer"})
+    }
+
+    /// The `WWW-Authenticate` challenge sent with a 401. Defaults to the bearer scheme and must match
+    /// [`Authenticator::security_scheme`].
+    fn challenge(&self) -> &'static str {
+        "Bearer"
     }
 }
 
@@ -115,33 +148,85 @@ impl OriginPolicy {
 }
 
 fn is_host(value: &str) -> bool {
-    !value.is_empty()
-        && !value.ends_with('.')
+    let Ok(authority) = value.parse::<Authority>() else {
+        return false;
+    };
+    authority.as_str() == value
+        && !value.contains('@')
+        && !authority.host().is_empty()
+        && !authority.host().ends_with('.')
         && value.bytes().all(|b| {
             b.is_ascii_lowercase()
                 || b.is_ascii_digit()
                 || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
         })
+        && authority.port().is_none_or(|_| authority.port_u16().is_some())
 }
 
 fn is_origin(value: &str) -> bool {
-    value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-        .is_some_and(is_host)
+    let (default_port, rest) = if let Some(rest) = value.strip_prefix("https://") {
+        (":443", rest)
+    } else if let Some(rest) = value.strip_prefix("http://") {
+        (":80", rest)
+    } else {
+        return false;
+    };
+    // Browsers leave a scheme's default port out of the Origin they send, so an entry spelling it
+    // could never match.
+    is_host(rest) && !rest.ends_with(default_port)
 }
 
-/// Origin policy and authentication, applied as one middleware.
+/// How much load the boundary admits. Both fields are required: a deployment states them, so none is
+/// a hidden default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    request_timeout: Duration,
+    max_in_flight: usize,
+}
+
+/// A limit that would admit no request, or never expire one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitsError(pub &'static str);
+
+impl Limits {
+    /// `request_timeout` bounds the whole time from admission to the last response byte; a request
+    /// over it is dropped and answered 504, which cancels a synchronous call's handler. Work that
+    /// can run longer than this is started as a detached operation and followed, which a request
+    /// deadline does not touch. `max_in_flight` is the number of requests served at once; the next
+    /// one is answered 503 at once rather than queued.
+    pub fn new(request_timeout: Duration, max_in_flight: usize) -> Result<Self, LimitsError> {
+        if request_timeout.is_zero() {
+            return Err(LimitsError("the request timeout must be positive"));
+        }
+        if max_in_flight == 0 {
+            return Err(LimitsError("at least one request must be admitted at once"));
+        }
+        Ok(Self {
+            request_timeout,
+            max_in_flight,
+        })
+    }
+}
+
+/// Load limits, origin policy and authentication, applied as one middleware.
 pub struct Boundary {
     authenticator: Arc<dyn Authenticator>,
     policy: OriginPolicy,
+    limits: Limits,
+    in_flight: Arc<Semaphore>,
 }
 
 impl Boundary {
-    pub fn new(authenticator: Arc<dyn Authenticator>, policy: OriginPolicy) -> Arc<Self> {
+    pub fn new(
+        authenticator: Arc<dyn Authenticator>,
+        policy: OriginPolicy,
+        limits: Limits,
+    ) -> Arc<Self> {
         Arc::new(Self {
             authenticator,
             policy,
+            limits,
+            in_flight: Arc::new(Semaphore::new(limits.max_in_flight)),
         })
     }
 
@@ -158,45 +243,89 @@ impl Boundary {
     /// [`Guarded`], which cannot be extended with unguarded routes.
     pub async fn guard(
         State(boundary): State<Arc<Boundary>>,
-        mut request: Request,
+        request: Request,
         next: Next,
     ) -> Response {
-        // HTTP/2 carries the authority in the URI and no Host header; HTTP/1.1 carries it in Host.
-        let host = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| request.uri().authority().map(|a| a.as_str()))
-            .map(str::to_owned);
-        // The origin check comes first, so a refused request never reaches credential handling.
-        let mut response = if !boundary.policy.admits(host.as_deref(), request.headers()) {
-            error_response(WireError::new(
-                ErrorCode::ForbiddenOrigin,
-                "this host or origin is not served",
-            ))
-        } else {
-            match boundary.authenticator.authenticate(request.headers()).await {
-                Some(principal) => {
-                    request.extensions_mut().insert(principal);
-                    next.run(request).await
-                }
-                None => {
-                    let mut response = error_response(WireError::new(
-                        ErrorCode::Unauthenticated,
-                        "authentication is required",
-                    ));
-                    response
-                        .headers_mut()
-                        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-                    response
+        // Shed load before reading anything: an unauthenticated caller costs a permit, nothing more.
+        let mut response = match boundary.in_flight.clone().try_acquire_owned() {
+            Err(_) => error_response(WireError::new(
+                ErrorCode::Unavailable,
+                "the server is busy",
+            )),
+            Ok(_permit) => {
+                // The permit is held until the response is built; the deadline covers the handler.
+                match tokio::time::timeout(
+                    boundary.limits.request_timeout,
+                    boundary.admit(request, next),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => error_response(WireError::new(
+                        ErrorCode::TimedOut,
+                        "the request took too long",
+                    )),
                 }
             }
         };
         // Every answer depends on the credential, so no cache may keep or share one.
         let headers = response.headers_mut();
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        headers.insert(header::VARY, HeaderValue::from_static("Authorization"));
+        headers.append(header::VARY, HeaderValue::from_static("Authorization"));
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
         response
+    }
+
+    async fn admit(&self, mut request: Request, next: Next) -> Response {
+        // HTTP/2 carries the authority in the URI and no Host header; HTTP/1.1 carries it in Host,
+        // and an absolute-form request line carries it in both. When both are present they must
+        // agree, since a proxy or the application may trust the one the policy did not check.
+        let header_host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok());
+        let uri_host = request.uri().authority().map(Authority::as_str);
+        let host = match (header_host, uri_host) {
+            (Some(header), Some(uri)) if header != uri => None,
+            (header, uri) => header.or(uri),
+        };
+        // The origin check comes first, so a refused request never reaches credential handling.
+        if !self.policy.admits(host, request.headers()) {
+            return error_response(WireError::new(
+                ErrorCode::ForbiddenOrigin,
+                "this host or origin is not served",
+            ));
+        }
+        // A repeated Authorization is ambiguous, and a front proxy may pick a different one.
+        let authentication = if request.headers().get_all(header::AUTHORIZATION).iter().count() > 1 {
+            Authentication::Rejected
+        } else {
+            self.authenticator.authenticate(request.headers()).await
+        };
+        match authentication {
+            Authentication::Authenticated(principal) => {
+                request.extensions_mut().insert(principal);
+                next.run(request).await
+            }
+            Authentication::Rejected => {
+                let mut response = error_response(WireError::new(
+                    ErrorCode::Unauthenticated,
+                    "authentication is required",
+                ));
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static(self.authenticator.challenge()),
+                );
+                response
+            }
+            Authentication::Unavailable => error_response(WireError::new(
+                ErrorCode::Unavailable,
+                "authentication is unavailable",
+            )),
+        }
     }
 }
 
@@ -223,7 +352,9 @@ impl Guarded {
     }
 
     /// For tests that drive the router without a socket. The result is a guarded router; adding to it
-    /// is the caller's responsibility and is not covered by the boundary.
+    /// is the caller's responsibility and is not covered by the boundary. Only built with the
+    /// `testing` feature, so production code cannot take the guard apart.
+    #[cfg(feature = "testing")]
     pub fn into_router_for_tests(self) -> Router {
         self.0
     }
@@ -243,11 +374,12 @@ impl<S: Send + Sync> FromRequestParts<S> for Authenticated {
             .map(Authenticated)
             // Reaching a handler without the boundary is a wiring mistake, never a caller error.
             .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                let mut response = error_response(WireError::new(
+                    ErrorCode::ContractViolation,
                     "the boundary middleware is not installed",
-                )
-                    .into_response()
+                ));
+                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                response
             })
     }
 }
@@ -260,7 +392,10 @@ pub fn status_for(code: ErrorCode) -> StatusCode {
         Denied | ForbiddenOrigin => StatusCode::FORBIDDEN,
         Unauthenticated => StatusCode::UNAUTHORIZED,
         Unsupported => StatusCode::NOT_IMPLEMENTED,
-        SupportUnknown | Cancelled | Interrupted | Store => StatusCode::SERVICE_UNAVAILABLE,
+        SupportUnknown | Cancelled | Interrupted | Store | Unavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        TimedOut => StatusCode::GATEWAY_TIMEOUT,
         ConfirmationRequired => StatusCode::PRECONDITION_REQUIRED,
         InvalidInput => StatusCode::UNPROCESSABLE_ENTITY,
         KeyConflict | InProgress => StatusCode::CONFLICT,

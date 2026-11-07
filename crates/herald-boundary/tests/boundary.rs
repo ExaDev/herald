@@ -10,12 +10,14 @@ use herald::{
     wire::{ErrorCode, WireError},
 };
 use herald_boundary::{
-    Authenticated, Authenticator, Boundary, Guarded, OriginPolicy, error_response, status_for,
+    Authenticated, Authentication, Authenticator, Boundary, Guarded, Limits, OriginPolicy,
+    error_response, status_for,
 };
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use tower::ServiceExt;
 
 /// Accepts exactly one bearer token. A header that claims an identity is ignored.
@@ -23,15 +25,23 @@ struct Tokens {
     calls: AtomicUsize,
 }
 impl Authenticator for Tokens {
-    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Option<Principal>> {
+    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            (headers.get(header::AUTHORIZATION)?.to_str().ok()? == "Bearer good-token")
-                .then(|| Principal::new("alice").unwrap())
+            if headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+                == Some("Bearer good-token")
+            {
+                Authentication::Authenticated(Principal::new("alice").unwrap())
+            } else {
+                Authentication::Rejected
+            }
         })
     }
 }
 
+fn limits() -> Limits {
+    Limits::new(Duration::from_secs(60), 64).unwrap()
+}
 fn tokens() -> Arc<Tokens> {
     Arc::new(Tokens {
         calls: AtomicUsize::new(0),
@@ -49,7 +59,7 @@ fn app(tokens: Arc<Tokens>) -> Router {
         "/whoami",
         get(|Authenticated(p): Authenticated| async move { p.identity().to_owned() }),
     );
-    Guarded::new(routes, Boundary::new(tokens, policy())).into_router_for_tests()
+    Guarded::new(routes, Boundary::new(tokens, policy(), limits())).into_router_for_tests()
 }
 fn request(extra: &[(&str, &str)]) -> Request<Body> {
     let mut builder = Request::builder()
@@ -350,6 +360,7 @@ async fn a_handler_behind_no_boundary_fails_loudly_instead_of_guessing_an_identi
     );
     let response = router.oneshot(request(&[])).await.unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body(response).await.contains("contract_violation"), "typed, not plain text");
 }
 
 /// Adding a code without deciding its status fails to compile here, and the table pins every status.
@@ -378,6 +389,8 @@ fn every_error_code_has_one_stable_http_status() {
             SourceFailed => S::BAD_GATEWAY,
             Unauthenticated => S::UNAUTHORIZED,
             ForbiddenOrigin => S::FORBIDDEN,
+            Unavailable => S::SERVICE_UNAVAILABLE,
+            TimedOut => S::GATEWAY_TIMEOUT,
         }
     }
     for code in [
@@ -400,6 +413,8 @@ fn every_error_code_has_one_stable_http_status() {
         SourceFailed,
         Unauthenticated,
         ForbiddenOrigin,
+        Unavailable,
+        TimedOut,
     ] {
         assert_eq!(status_for(code), expected(code), "{code:?}");
         assert_eq!(
@@ -407,4 +422,197 @@ fn every_error_code_has_one_stable_http_status() {
             expected(code)
         );
     }
+}
+
+fn app_with(authenticator: Arc<dyn Authenticator>, limits: Limits, routes: Router) -> Router {
+    Guarded::new(routes, Boundary::new(authenticator, policy(), limits)).into_router_for_tests()
+}
+
+#[tokio::test]
+async fn a_host_header_and_a_uri_authority_that_disagree_are_refused() {
+    let agree = Request::builder()
+        .uri("http://api.example.test/whoami")
+        .header("host", "api.example.test")
+        .header("authorization", "Bearer good-token")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app(tokens()).oneshot(agree).await.unwrap().status(), StatusCode::OK);
+    for (uri, host) in [
+        ("http://evil.test/whoami", "api.example.test"),
+        ("http://api.example.test/whoami", "evil.test"),
+    ] {
+        let split = Request::builder()
+            .uri(uri)
+            .header("host", host)
+            .header("authorization", "Bearer good-token")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app(tokens()).oneshot(split).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "{uri} {host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_authorization_header_is_refused_before_the_authenticator_sees_it() {
+    let seen = tokens();
+    let doubled = Request::builder()
+        .uri("/whoami")
+        .header("host", "api.example.test")
+        .header("authorization", "Bearer good-token")
+        .header("authorization", "Bearer good-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(seen.clone()).oneshot(doubled).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(seen.calls.load(Ordering::SeqCst), 0);
+}
+
+/// An authenticator whose backend is down.
+struct Down;
+impl Authenticator for Down {
+    fn authenticate<'a>(&'a self, _: &'a HeaderMap) -> PortFuture<'a, Authentication> {
+        Box::pin(async { Authentication::Unavailable })
+    }
+    fn challenge(&self) -> &'static str {
+        "Custom"
+    }
+}
+
+#[tokio::test]
+async fn an_authentication_backend_failure_is_a_retryable_503_not_a_rejected_credential() {
+    let routes = Router::new().route("/whoami", get(|| async { "x" }));
+    let response = app_with(Arc::new(Down), limits(), routes)
+        .oneshot(request(&[GOOD]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get("www-authenticate").is_none());
+    assert!(body(response).await.contains("unavailable"));
+}
+
+#[tokio::test]
+async fn the_challenge_comes_from_the_authenticator() {
+    struct Rejects;
+    impl Authenticator for Rejects {
+        fn authenticate<'a>(&'a self, _: &'a HeaderMap) -> PortFuture<'a, Authentication> {
+            Box::pin(async { Authentication::Rejected })
+        }
+        fn challenge(&self) -> &'static str {
+            "Custom realm=\"x\""
+        }
+    }
+    let routes = Router::new().route("/whoami", get(|| async { "x" }));
+    let response = app_with(Arc::new(Rejects), limits(), routes)
+        .oneshot(request(&[]))
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["www-authenticate"], "Custom realm=\"x\"");
+}
+
+#[tokio::test]
+async fn a_request_past_its_deadline_is_dropped_with_a_typed_504() {
+    let routes = Router::new().route(
+        "/whoami",
+        get(|| async {
+            std::future::pending::<()>().await;
+            "never"
+        }),
+    );
+    let limits = Limits::new(Duration::from_millis(50), 8).unwrap();
+    let response = app_with(tokens(), limits, routes)
+        .oneshot(request(&[GOOD]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(body(response).await.contains("timed_out"));
+}
+
+#[tokio::test]
+async fn requests_beyond_the_in_flight_limit_are_shed_at_once_and_a_permit_frees_on_completion() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let held = gate.clone();
+    let routes = Router::new().route(
+        "/whoami",
+        get(move || {
+            let held = held.clone();
+            async move {
+                held.notified().await;
+                "done"
+            }
+        }),
+    );
+    let router = app_with(tokens(), Limits::new(Duration::from_secs(30), 1).unwrap(), routes);
+    let first = tokio::spawn(router.clone().oneshot(request(&[GOOD])));
+    tokio::task::yield_now().await;
+    // The second request arrives while the first holds the only permit, even though it carries no
+    // credential: load is shed before anything is read.
+    let second = loop {
+        let attempt = router.clone().oneshot(request(&[])).await.unwrap();
+        if attempt.status() == StatusCode::SERVICE_UNAVAILABLE {
+            break attempt;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert!(body(second).await.contains("unavailable"));
+    gate.notify_one();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+    let after = router.clone().oneshot(request(&[])).await.unwrap();
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED, "the permit was released");
+}
+
+#[test]
+fn limits_that_admit_nothing_or_never_expire_cannot_be_built() {
+    assert!(Limits::new(Duration::ZERO, 1).is_err());
+    assert!(Limits::new(Duration::from_secs(1), 0).is_err());
+    assert!(Limits::new(Duration::from_secs(1), 1).is_ok());
+}
+
+#[test]
+fn entries_a_browser_could_never_match_or_that_are_not_authorities_are_rejected() {
+    let origins = |o: &str| OriginPolicy::new(["h.test".to_string()], [o.to_string()]);
+    for bad in [
+        "https://a.test:443",
+        "http://a.test:80",
+        "https://a.test:99999",
+        "https://a.test:b",
+        "https://user@a.test",
+        "https://a.test/",
+        "https://[",
+        "https://",
+    ] {
+        assert!(origins(bad).is_err(), "{bad}");
+    }
+    for good in ["https://a.test", "https://a.test:8443", "http://a.test:443", "https://[::1]:8443"] {
+        assert!(origins(good).is_ok(), "{good}");
+    }
+    for bad in ["a:b:c", "h.test:99999", "user@h.test", "h.test:", "[", ":80"] {
+        assert!(
+            OriginPolicy::new([bad.to_string()], Vec::<String>::new()).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_answer_carries_nosniff_and_keeps_a_vary_the_route_set() {
+    let routes = Router::new().route(
+        "/whoami",
+        get(|| async { ([(header::VARY, "Accept")], "x") }),
+    );
+    let response = app_with(tokens(), limits(), routes)
+        .oneshot(request(&[GOOD]))
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    let vary: Vec<_> = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_owned())
+        .collect();
+    assert!(vary.contains(&"Accept".to_string()) && vary.contains(&"Authorization".to_string()), "{vary:?}");
 }

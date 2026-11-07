@@ -8,7 +8,13 @@ description = "Authentication and origin policy at the edge of Herald's network 
 axum = "0.8"
 herald = { path = "../.." }
 serde_json = "1"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[features]
+# Exposes `Guarded::into_router_for_tests`, which hands back the router the guard wraps.
+testing = []
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+herald-boundary = { path = ".", features = ["testing"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 tower = { version = "0.5", features = ["util"] }
