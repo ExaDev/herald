@@ -9,7 +9,12 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
+pub mod contract_schema;
+pub mod exposure;
 pub mod runtime;
+pub mod schema_refs;
+pub mod service;
+pub mod wire;
 
 /// A future returned by an injected asynchronous port.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -57,6 +62,10 @@ pub struct Request {
     pub capability: CapabilityId,
     pub identity: String,
     pub input: Value,
+    /// Whether the transport claims the caller consented. The service never sets it from the wire
+    /// (it is always false there), so a product's [`Confirmer`] is the only authority on consent. The
+    /// confirmer runs before an idempotent replay is served, so replaying a completed operation that
+    /// requires confirmation asks the confirmer again and must be answerable more than once.
     pub confirmed: bool,
 }
 
@@ -73,6 +82,8 @@ pub enum Outcome {
 pub enum DispatchError {
     DuplicateCapability,
     InvalidSchema(String),
+    /// A capability name that adapters could not address safely.
+    InvalidName(String),
     NotFound,
     Denied,
     Unsupported,
@@ -226,6 +237,44 @@ pub trait Observer: Send + Sync {
     fn subscription_opened(&self, request: &Request, at: u64, result: &Result<(), DispatchError>);
 }
 
+/// The prefix adapters use for their own follow-up tools, so no capability may take it.
+pub const RESERVED_PREFIX: &str = "herald.";
+
+/// The longest tool name the MCP specification recommends (SEP-986: 1 to 64 characters). An MCP tool
+/// is `<name>.v<version>`, so a capability's name must leave room for that suffix.
+const MAX_TOOL_NAME_BYTES: usize = 64;
+
+/// The longest capability name: the tool-name bound less `.v` and the widest `u32` version.
+pub const MAX_NAME_BYTES: usize = MAX_TOOL_NAME_BYTES - ".v4294967295".len();
+
+/// A name is addressable on every surface: ASCII letters, digits, `_`, `-` and `.`, not reserved, and
+/// not ending in `.v<digits>`, which adapters read as a version suffix.
+fn validate_name(name: &str) -> Result<(), DispatchError> {
+    let bad = |reason: &str| Err(DispatchError::InvalidName(format!("{name:?}: {reason}")));
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return bad("too long to be an MCP tool name with a version suffix");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return bad("only ASCII letters, digits, '_', '-' and '.' are allowed");
+    }
+    if name.starts_with(RESERVED_PREFIX) {
+        return bad("the 'herald.' prefix is reserved");
+    }
+    if let Some((_, suffix)) = name.rsplit_once(".v")
+        && !suffix.is_empty()
+        && suffix.bytes().all(|b| b.is_ascii_digit())
+    {
+        return bad("a trailing '.v<digits>' reads as a version");
+    }
+    Ok(())
+}
+
 struct InFlight<'a> {
     observer: &'a dyn Observer,
     clock: &'a dyn Clock,
@@ -339,6 +388,7 @@ impl Dispatcher {
         handler: Option<Arc<dyn Handler>>,
         subscription: Option<Arc<dyn SubscriptionHandler>>,
     ) -> Result<(), DispatchError> {
+        validate_name(&contract.id.name)?;
         if self.entries.contains_key(&contract.id) {
             return Err(DispatchError::DuplicateCapability);
         }
@@ -371,6 +421,20 @@ impl Dispatcher {
             Some(entry) => self.authorizer.authorize(request, &entry.contract).await,
             None => false,
         }
+    }
+
+    /// As [`Dispatcher::authorise`], and reports a refusal to the observer as `Denied`, the same
+    /// record in-process dispatch leaves, so a remote caller's denials are audited too. An unknown
+    /// capability is not reported: there is no contract to deny.
+    pub async fn admit(&self, request: &Request) -> Result<(), DispatchError> {
+        if self.authorise(request).await {
+            return Ok(());
+        }
+        if self.entries.contains_key(&request.capability) {
+            self.observer
+                .finished(request, self.clock.now(), &Err(DispatchError::Denied));
+        }
+        Err(DispatchError::Denied)
     }
 
     /// Returns registered contracts. Exposure policy must be applied by the caller.
