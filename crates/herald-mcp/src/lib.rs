@@ -23,13 +23,14 @@ use herald::{
     Cancellation, CapabilityId, Kind,
     exposure::Surface,
     runtime::OperationId,
+    schema_refs::rewrite_refs,
     service::{
         CallResult, Descriptor, Executed, MAX_KEY_BYTES, Mode, Principal, Service, Shape,
         StartResult,
     },
     wire::{ErrorCode, WireError},
 };
-use herald_boundary::{Boundary, Guarded};
+use herald_boundary::{Boundary, Guarded, error_response};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
@@ -135,6 +136,30 @@ fn accepts_object(schema: &Value) -> bool {
 fn tool_input_schema(descriptor: &Descriptor) -> Value {
     match descriptor.kind {
         Kind::Operation => {
+            let mut input = descriptor.input_schema.clone();
+            // The schema now sits at `properties/input`, so a pointer to its own root or into it moves
+            // with it. Pointers to `$defs` stay valid because the definitions are hoisted below.
+            rewrite_refs(&mut input, &|reference| {
+                if reference == "#" {
+                    return Some("#/properties/input".to_owned());
+                }
+                let keeps = ["#/$defs/", "#/definitions/"]
+                    .iter()
+                    .any(|root| reference.starts_with(root));
+                (!keeps)
+                    .then(|| reference.strip_prefix("#/"))
+                    .flatten()
+                    .map(|pointer| format!("#/properties/input/{pointer}"))
+            });
+            // The definitions move to the wrapper's root, where `#/$defs/...` pointers resolve.
+            let mut hoisted = Map::new();
+            if let Value::Object(map) = &mut input {
+                for definitions in ["$defs", "definitions"] {
+                    if let Some(found) = map.remove(definitions) {
+                        hoisted.insert(definitions.to_owned(), found);
+                    }
+                }
+            }
             let mut wrapper = json!({
                 "type": "object",
                 "required": ["idempotency_key", "input"],
@@ -145,19 +170,15 @@ fn tool_input_schema(descriptor: &Descriptor) -> Value {
                         "minLength": 1,
                         "description": format!("At most {MAX_KEY_BYTES} bytes. A retry with the same key replays the recorded outcome."),
                     },
-                    "input": descriptor.input_schema,
+                    "input": input,
                     "detach": {
                         "type": "boolean",
                         "description": "Return the operation id as soon as it is running instead of waiting for its outcome."
                     }
                 }
             });
-            if let Value::Object(input) = &descriptor.input_schema {
-                for definitions in ["$defs", "definitions"] {
-                    if let Some(defs) = input.get(definitions) {
-                        wrapper[definitions] = defs.clone();
-                    }
-                }
+            for (name, definitions) in hoisted {
+                wrapper[name] = definitions;
             }
             wrapper
         }
@@ -301,8 +322,7 @@ impl ServerHandler for HeraldMcp {
 
         // Sizes are judged first and alike for every name, so an oversized request cannot tell an
         // exposed tool from an unknown one.
-        let key_hint = payload.get("idempotency_key").and_then(Value::as_str);
-        if let Err(error) = Service::check_bounds(&payload, key_hint) {
+        if let Err(error) = Service::check_bounds(&payload) {
             return Ok(failure(error));
         }
         let Value::Object(arguments) = &payload else {
@@ -422,7 +442,41 @@ pub fn routes(service: Arc<Service>, boundary: &Boundary) -> axum::Router {
         Arc::new(NeverSessionManager::default()),
         config,
     );
-    axum::Router::new().nest_service(MCP_PATH, mcp)
+    axum::Router::new()
+        .route_service(MCP_PATH, mcp)
+        .fallback(|| async { error_response(WireError::new(ErrorCode::NotFound, "no such route")) })
+        .layer(axum::middleware::from_fn(typed_errors))
+}
+
+/// The SDK answers a request it refuses before any handler runs (wrong `Accept`, `Content-Type` or
+/// method, an oversized body, a rejected host) with a plain-text body. Those answers do not depend on
+/// the capability named, so they leak nothing, but a client expects every failure to be a typed
+/// error: the status stays and the body becomes one. A JSON body, such as the SDK's own JSON-RPC
+/// error, is already structured and passes through.
+async fn typed_errors(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    let response = next.run(request).await;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || is_json {
+        return response;
+    }
+    let (code, message) = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => (ErrorCode::TooLarge, "the request is too large"),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::NOT_ACCEPTABLE => (
+            ErrorCode::UnsupportedMedia,
+            "the request media type is not supported",
+        ),
+        StatusCode::NOT_FOUND => (ErrorCode::NotFound, "no such route"),
+        _ => (ErrorCode::BadRequest, "the request was refused"),
+    };
+    let mut typed = error_response(WireError::new(code, message));
+    *typed.status_mut() = status;
+    typed
 }
 
 /// The MCP network transport behind the boundary.

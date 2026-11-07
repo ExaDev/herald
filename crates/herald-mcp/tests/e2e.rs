@@ -10,7 +10,7 @@ use herald::{
     runtime::{MemoryOperationStore, Runtime},
     service::{Principal, Service},
 };
-use herald_boundary::{Authenticator, Boundary, OriginPolicy};
+use herald_boundary::{Authentication, Authenticator, Boundary, Limits, OriginPolicy};
 use herald_mcp::{EVENTS_TOOL, HeraldMcp, OPERATION_TOOL, rmcp, router};
 use rmcp::{
     ServiceExt,
@@ -29,6 +29,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Notify;
+
+/// Generous limits: these suites test behaviour, not load.
+fn limits() -> Limits {
+    Limits::new(Duration::from_secs(60), 64).unwrap()
+}
 
 const ORIGIN: &str = "https://app.example.test";
 
@@ -85,13 +90,14 @@ impl Handler for Work {
 /// Bearer tokens the product accepts, and who they name.
 struct Tokens;
 impl Authenticator for Tokens {
-    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Option<Principal>> {
+    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication> {
         Box::pin(async move {
-            match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
+            let principal: Option<Principal> = (|| match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
                 "Bearer alice-token" => Principal::new("alice").ok(),
                 "Bearer mallory-token" => Principal::new("mallory").ok(),
                 _ => None,
-            }
+            })();
+            principal.into()
         })
     }
 }
@@ -157,7 +163,7 @@ async fn world() -> World {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let policy = OriginPolicy::new([format!("127.0.0.1:{port}")], [ORIGIN.to_string()]).unwrap();
-    let app = router(service.clone(), Boundary::new(Arc::new(Tokens), policy));
+    let app = router(service.clone(), Boundary::new(Arc::new(Tokens), policy, limits()));
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
             .await
@@ -620,7 +626,7 @@ async fn the_sdk_refuses_a_foreign_origin_even_without_the_boundary() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let policy = OriginPolicy::new([address.to_string()], [ORIGIN.to_string()]).unwrap();
-    let boundary = Boundary::new(Arc::new(Tokens), policy);
+    let boundary = Boundary::new(Arc::new(Tokens), policy, limits());
     let app = herald_mcp::routes(world.service.clone(), &boundary);
     let url = format!("http://{address}/mcp");
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -642,7 +648,7 @@ async fn the_unguarded_routes_refuse_every_call_because_no_boundary_named_a_call
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let policy = OriginPolicy::new([address.to_string()], [ORIGIN.to_string()]).unwrap();
-    let boundary = Boundary::new(Arc::new(Tokens), policy);
+    let boundary = Boundary::new(Arc::new(Tokens), policy, limits());
     let app = herald_mcp::routes(world.service.clone(), &boundary);
     let url = format!("http://{address}/mcp");
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
