@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
+pub mod exposure;
 pub mod runtime;
+pub mod service;
+pub mod wire;
 
 /// A future returned by an injected asynchronous port.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

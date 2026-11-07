@@ -293,6 +293,23 @@ pub trait Transport: Send + Sync {
     ) -> PortFuture<'a, Result<Vec<OperationEvent>, TransportError>>;
 }
 
+/// One in-flight attempt to run an operation.
+struct Attempt {
+    id: OperationId,
+    task: tokio::task::JoinHandle<(Result<Outcome, DispatchError>, Option<StoreError>)>,
+    reserved: Arc<AtomicBool>,
+    admitted: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// How [`Runtime::start`] returned.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Started {
+    /// The operation is running on its own task under this id.
+    Running(OperationId),
+    /// The request was turned away, or finished, before it could run detached.
+    Finished(Submission),
+}
+
 /// Durable, idempotent execution in front of a [`Dispatcher`].
 ///
 /// Needs a `tokio` runtime: each handler runs on a spawned task.
@@ -345,6 +362,49 @@ impl Runtime {
         key: String,
         cancellation: Cancellation,
     ) -> Submission {
+        let attempt = self.spawn_attempt(request, key, cancellation);
+        self.finish(attempt).await
+    }
+
+    /// As [`Runtime::submit`], but returns as soon as the operation is running. A request that policy
+    /// or the store turns away finishes first and is returned as [`Started::Finished`]. Otherwise the
+    /// handler continues on its own task and records its outcome, and the operation can be followed
+    /// by id from any adapter through [`Runtime::get`] and [`Runtime::events_after`]. The same key
+    /// retried later replays the recorded outcome as for `submit`.
+    pub async fn start(
+        &self,
+        request: Request,
+        key: String,
+        cancellation: Cancellation,
+    ) -> Started {
+        let mut attempt = self.spawn_attempt(request, key, cancellation);
+        let admitted = attempt
+            .admitted
+            .take()
+            .expect("a fresh attempt has its admission signal");
+        tokio::select! {
+            signal = admitted => {
+                if signal.is_ok() {
+                    let id = attempt.id.clone();
+                    let store = Arc::clone(&self.store);
+                    // A panic after admission must still be recorded, as `submit` would.
+                    tokio::spawn(async move {
+                        let Attempt { id, task, reserved, .. } = attempt;
+                        if task.await.is_err() && reserved.load(Ordering::SeqCst) {
+                            let _ = store.abandon(&id).await;
+                        }
+                    });
+                    Started::Running(id)
+                } else {
+                    // The gate was dropped without admitting: the attempt has already finished.
+                    Started::Finished(self.finish(attempt).await)
+                }
+            }
+            submission = self.finish_ref(&mut attempt) => Started::Finished(submission),
+        }
+    }
+
+    fn spawn_attempt(&self, request: Request, key: String, cancellation: Cancellation) -> Attempt {
         let scope = request.identity.clone();
         let id = operation_id(&scope, &key);
         let record = OperationRecord {
@@ -364,12 +424,14 @@ impl Runtime {
         let lease = Arc::clone(&self.lease);
         let reserved = Arc::new(AtomicBool::new(false));
         let task_reserved = Arc::clone(&reserved);
+        let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _lease = lease;
             let gate = RuntimeGate {
                 store: store.as_ref(),
                 record,
                 reserved: task_reserved,
+                admitted: Mutex::new(Some(admit_tx)),
                 record_error: Mutex::new(None),
             };
             let result = dispatcher.dispatch_with(request, cancellation, &gate).await;
@@ -384,7 +446,21 @@ impl Runtime {
             tasks.retain(|task| !task.is_finished());
             tasks.push(task.abort_handle());
         }
-        match task.await {
+        Attempt {
+            id,
+            task,
+            reserved,
+            admitted: Some(admit_rx),
+        }
+    }
+
+    async fn finish(&self, mut attempt: Attempt) -> Submission {
+        self.finish_ref(&mut attempt).await
+    }
+
+    async fn finish_ref(&self, attempt: &mut Attempt) -> Submission {
+        let id = attempt.id.clone();
+        match (&mut attempt.task).await {
             Ok((result, record_error)) => Submission {
                 id,
                 result,
@@ -393,7 +469,7 @@ impl Runtime {
             Err(_) => {
                 // The task panicked or was cancelled at shutdown. Only an attempt that reserved the
                 // record may mark it, or a failure before admission would interrupt another live attempt.
-                let record_error = if reserved.load(Ordering::SeqCst) {
+                let record_error = if attempt.reserved.load(Ordering::SeqCst) {
                     self.store.abandon(&id).await.err()
                 } else {
                     None
@@ -495,6 +571,8 @@ struct RuntimeGate<'a> {
     record: OperationRecord,
     /// Set once this attempt holds the reservation, shared with the submitting future.
     reserved: Arc<AtomicBool>,
+    /// Fired when the reservation is held and the handler is about to run, so `start` can return early.
+    admitted: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     record_error: Mutex<Option<StoreError>>,
 }
 
@@ -504,6 +582,14 @@ impl Gate for RuntimeGate<'_> {
             match self.store.reserve(self.record.clone()).await {
                 Ok(Reservation::New) => {
                     self.reserved.store(true, Ordering::SeqCst);
+                    if let Some(sender) = self
+                        .admitted
+                        .lock()
+                        .expect("signal lock is never poisoned")
+                        .take()
+                    {
+                        let _ = sender.send(());
+                    }
                     Admission::Proceed
                 }
                 Ok(Reservation::Conflict) => Admission::Reject(DispatchError::KeyConflict),
