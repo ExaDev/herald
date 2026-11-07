@@ -19,6 +19,11 @@ pub const MAX_KEY_BYTES: usize = 256;
 /// authorised against it, which makes this a bound on what one caller can place in the store.
 pub const MAX_INPUT_BYTES: usize = 1 << 20;
 
+/// The largest raw request payload an adapter accepts before it has looked at the capability. It is
+/// the input bound plus room for an adapter's envelope (an idempotency key, a detach flag, field
+/// names), so a request whose input is within bounds is never refused for its wrapper alone.
+pub const MAX_REQUEST_BYTES: usize = MAX_INPUT_BYTES + 4096;
+
 /// An authenticated caller. Only an adapter that has authenticated the caller constructs one, and its
 /// identity replaces anything the caller claims about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +68,81 @@ pub struct CallResult {
     pub outcome: Outcome,
     /// False when the handler ran but its outcome could not be recorded.
     pub recorded: bool,
+    /// The handler reported an error outcome. Adapters mirror this in their own failure signal.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failed: bool,
+    /// The outcome is unknown: the operation may or may not have taken effect. It is not a success
+    /// and not a safe-to-retry failure. Adapters carry this field as is.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub uncertain: bool,
+}
+
+impl CallResult {
+    fn new(operation: Option<OperationId>, outcome: Outcome, recorded: bool) -> Self {
+        let failed = matches!(outcome, Outcome::Error(_));
+        let uncertain = matches!(outcome, Outcome::Unknown(_));
+        Self {
+            operation,
+            outcome,
+            recorded,
+            failed,
+            uncertain,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// How an adapter lays out a request's payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// The payload is the capability's input and nothing else, so there is no key and no detach.
+    Direct,
+    /// The payload is `{"input", "idempotency_key"?, "detach"?}` and nothing else.
+    Envelope,
+    /// As `Envelope` but `detach` is refused, for an adapter whose route already chose to wait.
+    EnvelopeWait,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope {
+    input: Value,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    detach: Option<bool>,
+}
+
+/// A request that has passed exposure, authorisation and shape checks, in that order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prepared {
+    pub kind: Kind,
+    pub input: Value,
+    pub key: Option<String>,
+    /// For an operation, whether the caller asked to return once it is running.
+    pub detach: bool,
+}
+
+/// How to run a prepared request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Run to completion.
+    Call,
+    /// Return once the operation is running. Only an operation can be started.
+    Start,
+    /// Follow the request's own `detach` flag.
+    AsRequested,
+}
+
+/// What running a prepared request produced.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Executed {
+    Call(CallResult),
+    Start(StartResult),
 }
 
 /// How a started operation stands.
@@ -118,8 +198,114 @@ impl Service {
         listed
     }
 
-    /// Runs a capability to completion. A query runs once and leaves no record. An operation needs an
+    /// Checks everything that does not need the caller to be authorised, then authorises, and only
+    /// then looks at the payload's shape. A caller the product has denied therefore sees the same
+    /// `NotFound` for an exposed capability, an unexposed one and an unknown one, whatever it sends.
+    ///
+    /// The order is fixed because each step must not reveal more than the one before it allows:
+    /// size bounds apply to every payload alike, exposure is next, then authorisation against the
+    /// input the payload names (read leniently, since it is not yet validated), then the strict shape.
+    pub async fn prepare(
+        &self,
+        principal: &Principal,
+        surface: Surface,
+        capability: &CapabilityId,
+        payload: Value,
+        shape: impl FnOnce(&Kind) -> Shape,
+    ) -> Result<Prepared, WireError> {
+        let key_hint = payload.get("idempotency_key").and_then(Value::as_str);
+        Self::check_bounds(&payload, key_hint)?;
+        let kind = self.kind_of(surface, capability)?;
+        let shape = shape(&kind);
+        let probe = match shape {
+            Shape::Direct => payload.clone(),
+            _ => payload.get("input").cloned().unwrap_or(Value::Null),
+        };
+        self.admit(&self.request(principal, capability, probe))
+            .await?;
+        let (input, key, detach) = match shape {
+            Shape::Direct => (payload, None, false),
+            Shape::Envelope | Shape::EnvelopeWait => {
+                let envelope: Envelope = serde_json::from_value(payload).map_err(|_| {
+                    WireError::new(
+                        ErrorCode::BadRequest,
+                        "the request does not match the expected shape",
+                    )
+                })?;
+                if shape == Shape::EnvelopeWait && envelope.detach.is_some() {
+                    return Err(WireError::new(
+                        ErrorCode::BadRequest,
+                        "this route does not take a detach flag",
+                    ));
+                }
+                (
+                    envelope.input,
+                    envelope.idempotency_key,
+                    envelope.detach.unwrap_or(false),
+                )
+            }
+        };
+        bound(&input, key.as_deref())?;
+        Ok(Prepared {
+            kind,
+            input,
+            key,
+            detach,
+        })
+    }
+
+    /// Runs a prepared request. A query runs once and leaves no record. An operation needs an
     /// idempotency key: it is recorded, and a retry with the same key replays the recorded outcome.
+    pub async fn execute(
+        &self,
+        principal: &Principal,
+        capability: &CapabilityId,
+        prepared: Prepared,
+        mode: Mode,
+        cancellation: Cancellation,
+    ) -> Result<Executed, WireError> {
+        let request = self.request(principal, capability, prepared.input);
+        let start = match (mode, prepared.kind.clone()) {
+            (Mode::Start, Kind::Operation) => true,
+            (Mode::AsRequested, Kind::Operation) => prepared.detach,
+            (Mode::Start, _) => {
+                return Err(WireError::new(
+                    ErrorCode::BadRequest,
+                    "only an operation can be started and followed",
+                ));
+            }
+            _ => false,
+        };
+        match prepared.kind {
+            Kind::Query => {
+                let outcome = self
+                    .dispatcher
+                    .dispatch(request, cancellation)
+                    .await
+                    .map_err(|e| WireError::from(&e))?;
+                Ok(Executed::Call(CallResult::new(None, outcome, false)))
+            }
+            Kind::Operation if start => {
+                let key = require_key(prepared.key)?;
+                Ok(Executed::Start(
+                    match self.runtime.start(request, key, cancellation).await {
+                        Started::Running(operation) => StartResult::Running { operation },
+                        Started::Finished(submission) => {
+                            StartResult::Finished(finished(submission)?)
+                        }
+                    },
+                ))
+            }
+            Kind::Operation => {
+                let key = require_key(prepared.key)?;
+                let submission = self.runtime.submit(request, key, cancellation).await;
+                Ok(Executed::Call(finished(submission)?))
+            }
+            Kind::Subscription => Err(not_found()),
+        }
+    }
+
+    /// Runs a capability to completion for an embedder that already has typed arguments.
     pub async fn call(
         &self,
         principal: &Principal,
@@ -129,29 +315,18 @@ impl Service {
         key: Option<String>,
         cancellation: Cancellation,
     ) -> Result<CallResult, WireError> {
-        let kind = self.kind_of(surface, capability)?;
-        bound(&input, key.as_deref())?;
-        let request = self.request(principal, capability, input);
-        self.admit(&request).await?;
-        match kind {
-            Kind::Query => {
-                let outcome = self
-                    .dispatcher
-                    .dispatch(request, cancellation)
-                    .await
-                    .map_err(|e| WireError::from(&e))?;
-                Ok(CallResult {
-                    operation: None,
-                    outcome,
-                    recorded: false,
-                })
-            }
-            Kind::Operation => {
-                let key = require_key(key)?;
-                let submission = self.runtime.submit(request, key, cancellation).await;
-                finished(submission)
-            }
-            Kind::Subscription => Err(not_found()),
+        let payload = envelope(input, key);
+        let prepared = self
+            .prepare(principal, surface, capability, payload, |_| {
+                Shape::EnvelopeWait
+            })
+            .await?;
+        match self
+            .execute(principal, capability, prepared, Mode::Call, cancellation)
+            .await?
+        {
+            Executed::Call(result) => Ok(result),
+            Executed::Start(_) => unreachable!("Mode::Call never starts"),
         }
     }
 
@@ -166,22 +341,18 @@ impl Service {
         key: Option<String>,
         cancellation: Cancellation,
     ) -> Result<StartResult, WireError> {
-        let kind = self.kind_of(surface, capability)?;
-        bound(&input, key.as_deref())?;
-        let request = self.request(principal, capability, input);
-        // Authorisation comes before any answer that depends on the capability's kind, or a denied
-        // caller could tell an exposed query from an exposed operation.
-        self.admit(&request).await?;
-        if kind != Kind::Operation {
-            return Err(WireError::new(
-                ErrorCode::BadRequest,
-                "only an operation can be started and followed",
-            ));
-        }
-        let key = require_key(key)?;
-        match self.runtime.start(request, key, cancellation).await {
-            Started::Running(operation) => Ok(StartResult::Running { operation }),
-            Started::Finished(submission) => finished(submission).map(StartResult::Finished),
+        let payload = envelope(input, key);
+        let prepared = self
+            .prepare(principal, surface, capability, payload, |_| {
+                Shape::EnvelopeWait
+            })
+            .await?;
+        match self
+            .execute(principal, capability, prepared, Mode::Start, cancellation)
+            .await?
+        {
+            Executed::Start(result) => Ok(result),
+            Executed::Call(_) => unreachable!("Mode::Start always starts"),
         }
     }
 
@@ -204,7 +375,7 @@ impl Service {
         Ok(view)
     }
 
-    /// Events from `cursor` onward, with the same visibility as [`Service::operation`].
+    /// Events from `cursor` onward, from the one read and authorisation that `operation` performs.
     pub async fn events_after(
         &self,
         principal: &Principal,
@@ -212,11 +383,13 @@ impl Service {
         id: &OperationId,
         cursor: u64,
     ) -> Result<Vec<OperationEvent>, WireError> {
-        self.operation(principal, surface, id).await?;
-        self.runtime
-            .events_after(principal.identity(), id, cursor)
-            .await
-            .map_err(store)
+        Ok(self
+            .operation(principal, surface, id)
+            .await?
+            .events
+            .into_iter()
+            .filter(|event| event.seq >= cursor)
+            .collect())
     }
 
     fn request(&self, principal: &Principal, capability: &CapabilityId, input: Value) -> Request {
@@ -227,6 +400,25 @@ impl Service {
             // A caller's claim of consent is never taken from the wire: the product's confirmer decides.
             confirmed: false,
         }
+    }
+
+    /// Checks a raw request payload and key against the size bounds. An adapter calls this for every
+    /// request, whatever tool or capability it names, before any lookup, so the answer for an
+    /// oversized request is the same for an exposed capability, an unexposed one and an unknown one.
+    pub fn check_bounds(payload: &Value, key: Option<&str>) -> Result<(), WireError> {
+        if key.is_some_and(|k| k.len() > MAX_KEY_BYTES) {
+            return Err(WireError::new(
+                ErrorCode::BadRequest,
+                "the idempotency key is too long",
+            ));
+        }
+        if payload.to_string().len() > MAX_REQUEST_BYTES {
+            return Err(WireError::new(
+                ErrorCode::BadRequest,
+                "the request is too large",
+            ));
+        }
+        Ok(())
     }
 
     /// A caller the product does not authorise for this request sees what an unknown capability shows.
@@ -290,11 +482,19 @@ fn finished(submission: crate::runtime::Submission) -> Result<CallResult, WireEr
         ));
     }
     match submission.result {
-        Ok(outcome) => Ok(CallResult {
-            operation: Some(submission.id),
+        Ok(outcome) => Ok(CallResult::new(
+            Some(submission.id),
             outcome,
-            recorded: submission.record_error.is_none(),
-        }),
+            submission.record_error.is_none(),
+        )),
         Err(error) => Err(WireError::from(&error)),
+    }
+}
+
+/// An envelope built from typed arguments, so the embedding API takes the same path as an adapter.
+fn envelope(input: Value, key: Option<String>) -> Value {
+    match key {
+        Some(key) => serde_json::json!({"input": input, "idempotency_key": key}),
+        None => serde_json::json!({"input": input}),
     }
 }

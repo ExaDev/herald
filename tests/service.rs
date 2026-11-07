@@ -3,7 +3,10 @@ use herald::runtime::{
     MemoryOperationStore, OperationId, OperationRecord, OperationState, OperationStore,
     Reservation, Runtime, StoreError,
 };
-use herald::service::{MAX_INPUT_BYTES, MAX_KEY_BYTES, Principal, Service, StartResult};
+use herald::service::{
+    Executed, MAX_INPUT_BYTES, MAX_KEY_BYTES, MAX_REQUEST_BYTES, Mode as ServiceMode, Principal,
+    Service, Shape, StartResult,
+};
 use herald::wire::{ErrorCode, WireError};
 use herald::{
     Authorizer, Cancellation, CapabilityId, Clock, Confirmer, Contract, DispatchError, Dispatcher,
@@ -57,6 +60,8 @@ enum Mode {
     Immediate,
     WaitForRelease,
     Panic,
+    Fail,
+    Doubt,
 }
 
 /// Records every request it is given, so a test can assert what the handler actually saw.
@@ -74,6 +79,8 @@ impl Handler for Work {
             match self.mode {
                 Mode::WaitForRelease => self.release.notified().await,
                 Mode::Panic => panic!("handler failure"),
+                Mode::Fail => return Outcome::Error(json!({"why": "refused"})),
+                Mode::Doubt => return Outcome::Unknown(json!({"why": "lost the link"})),
                 Mode::Immediate => {}
             }
             Outcome::Success(json!({"caller": r.identity, "input": r.input}))
@@ -107,9 +114,11 @@ fn live() -> Cancellation {
     cancellation().1
 }
 fn all(surface: Surface) -> Exposure {
-    ["read", "write", "slow", "guarded", "boom", "events"]
-        .into_iter()
-        .fold(Exposure::none(), |e, n| e.allow(surface, id(n)))
+    [
+        "read", "write", "slow", "guarded", "boom", "events", "fails", "doubts",
+    ]
+    .into_iter()
+    .fold(Exposure::none(), |e, n| e.allow(surface, id(n)))
 }
 
 struct Fixture {
@@ -164,6 +173,13 @@ async fn fixture_with(confirm_claimed: bool, store: Arc<dyn OperationStore>) -> 
     .unwrap();
     d.register(contract("boom", Kind::Operation, false), work(Mode::Panic))
         .unwrap();
+    d.register(contract("fails", Kind::Operation, false), work(Mode::Fail))
+        .unwrap();
+    d.register(
+        contract("doubts", Kind::Operation, false),
+        work(Mode::Doubt),
+    )
+    .unwrap();
     struct NoSource;
     impl herald::SubscriptionHandler for NoSource {
         fn subscribe<'a>(
@@ -235,7 +251,7 @@ async fn exposure_is_per_surface_and_an_unexposed_capability_looks_unknown() {
     let service = f.service(all(Surface::Mcp));
     let alice = who("alice");
     // Subscriptions are not advertised until they have a call path.
-    assert_eq!(service.list(&alice, Surface::Mcp).await.len(), 5);
+    assert_eq!(service.list(&alice, Surface::Mcp).await.len(), 7);
     assert!(service.list(&alice, Surface::Api).await.is_empty());
     let unexposed = service
         .call(&alice, Surface::Api, &id("read"), json!({}), None, live())
@@ -473,6 +489,100 @@ async fn oversized_keys_and_inputs_are_refused_before_anything_runs() {
         .await
         .unwrap_err();
     assert_eq!(large.code, ErrorCode::BadRequest);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_oversized_request_gets_one_answer_whether_the_capability_exists_or_not() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let mallory = who("mallory"); // denied everything, so any difference would be a leak
+    let alice = who("alice");
+    let key = "k".repeat(MAX_KEY_BYTES + 1);
+    // Far over the request bound: refused identically before any lookup, for every name.
+    let huge = json!({"blob": "x".repeat(MAX_REQUEST_BYTES)});
+    // Just over the input bound but inside the envelope allowance: judged after authorisation.
+    let big = json!({"blob": "x".repeat(MAX_INPUT_BYTES)});
+    for name in ["read", "write", "slow", "nothing"] {
+        let long_key = service
+            .call(
+                &mallory,
+                Surface::Api,
+                &id(name),
+                json!({}),
+                Some(key.clone()),
+                live(),
+            )
+            .await
+            .unwrap_err();
+        let long_start = service
+            .start(
+                &mallory,
+                Surface::Api,
+                &id(name),
+                json!({}),
+                Some(key.clone()),
+                live(),
+            )
+            .await
+            .unwrap_err();
+        let huge_call = service
+            .call(
+                &mallory,
+                Surface::Api,
+                &id(name),
+                huge.clone(),
+                Some("k".into()),
+                live(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(long_key.code, ErrorCode::BadRequest, "{name}");
+        assert_eq!(long_start.code, ErrorCode::BadRequest, "{name}");
+        assert_eq!(huge_call.code, ErrorCode::BadRequest, "{name}");
+        let denied = service
+            .call(
+                &mallory,
+                Surface::Api,
+                &id(name),
+                big.clone(),
+                Some("k".into()),
+                live(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code,
+            ErrorCode::NotFound,
+            "a denied caller sees only not_found for {name}"
+        );
+    }
+    // An authorised caller is told the input is too large.
+    let told = service
+        .call(
+            &alice,
+            Surface::Api,
+            &id("write"),
+            big,
+            Some("k".into()),
+            live(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(told.code, ErrorCode::BadRequest);
+    assert_eq!(
+        Service::check_bounds(&json!({}), Some(&key))
+            .unwrap_err()
+            .code,
+        ErrorCode::BadRequest
+    );
+    assert!(
+        Service::check_bounds(
+            &json!({"input": {"x": 1}, "idempotency_key": "k"}),
+            Some("k")
+        )
+        .is_ok()
+    );
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -899,6 +1009,8 @@ async fn start_results_and_wire_errors_survive_a_serde_round_trip() {
         operation: None,
         outcome: Outcome::Success(json!({"a": 1})),
         recorded: true,
+        failed: false,
+        uncertain: false,
     });
     assert_eq!(
         serde_json::from_str::<StartResult>(&serde_json::to_string(&finished).unwrap()).unwrap(),
@@ -944,4 +1056,284 @@ async fn a_policy_that_denies_a_null_input_hides_the_capability_from_the_list() 
         Exposure::none().allow(Surface::Api, id("read")),
     );
     assert!(service.list(&who("alice"), Surface::Api).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_error_and_an_unknown_outcome_are_flagged_in_the_result_the_same_way_for_every_adapter()
+{
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let alice = who("alice");
+    let failed = service
+        .call(
+            &alice,
+            Surface::Api,
+            &id("fails"),
+            json!({}),
+            Some("a".into()),
+            live(),
+        )
+        .await
+        .unwrap();
+    assert!(failed.failed && !failed.uncertain);
+    let doubtful = service
+        .call(
+            &alice,
+            Surface::Api,
+            &id("doubts"),
+            json!({}),
+            Some("b".into()),
+            live(),
+        )
+        .await
+        .unwrap();
+    assert!(doubtful.uncertain && !doubtful.failed);
+    let fine = service
+        .call(
+            &alice,
+            Surface::Api,
+            &id("write"),
+            json!({}),
+            Some("c".into()),
+            live(),
+        )
+        .await
+        .unwrap();
+    assert!(!fine.failed && !fine.uncertain);
+    // The flags are in the serialised result, so a client of any adapter can read them, and a replay keeps them.
+    assert_eq!(serde_json::to_value(&failed).unwrap()["failed"], true);
+    assert!(serde_json::to_value(&fine).unwrap().get("failed").is_none());
+    let replay = service
+        .call(
+            &alice,
+            Surface::Api,
+            &id("doubts"),
+            json!({}),
+            Some("b".into()),
+            live(),
+        )
+        .await
+        .unwrap();
+    assert!(replay.uncertain);
+}
+
+#[tokio::test]
+async fn the_shape_of_a_payload_is_judged_only_after_the_caller_is_authorised() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let alice = who("alice");
+    let mallory = who("mallory");
+    let strict = |_: &Kind| Shape::Envelope;
+    let malformed = [
+        json!({}),
+        json!({"input": {}, "extra": 1}),
+        json!({"input": {}, "idempotency_key": 5}),
+        json!({"input": {}, "detach": "yes"}),
+    ];
+    for payload in malformed {
+        let denied = service
+            .prepare(
+                &mallory,
+                Surface::Api,
+                &id("write"),
+                payload.clone(),
+                strict,
+            )
+            .await
+            .unwrap_err();
+        let unknown = service
+            .prepare(
+                &mallory,
+                Surface::Api,
+                &id("nothing"),
+                payload.clone(),
+                strict,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied, unknown,
+            "a denied caller learns nothing from {payload}"
+        );
+        let authorised = service
+            .prepare(&alice, Surface::Api, &id("write"), payload.clone(), strict)
+            .await
+            .unwrap_err();
+        assert_eq!(authorised.code, ErrorCode::BadRequest, "{payload}");
+    }
+    let ok = service
+        .prepare(
+            &alice,
+            Surface::Api,
+            &id("write"),
+            json!({"input": {"x": 1}, "idempotency_key": "k", "detach": true}),
+            strict,
+        )
+        .await
+        .unwrap();
+    assert!(ok.detach && ok.key.as_deref() == Some("k"));
+    let wait_only = service
+        .prepare(
+            &alice,
+            Surface::Api,
+            &id("write"),
+            json!({"input": {}, "detach": true}),
+            |_| Shape::EnvelopeWait,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wait_only.code, ErrorCode::BadRequest);
+    let direct = service
+        .prepare(&alice, Surface::Api, &id("read"), json!({"x": 1}), |_| {
+            Shape::Direct
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (direct.key, direct.detach, direct.input),
+        (None, false, json!({"x": 1}))
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn execute_follows_the_requested_mode_and_refuses_to_start_a_query() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let alice = who("alice");
+    let prepared = service
+        .prepare(
+            &alice,
+            Surface::Api,
+            &id("slow"),
+            json!({"input": {}, "idempotency_key": "k", "detach": true}),
+            |_| Shape::Envelope,
+        )
+        .await
+        .unwrap();
+    match service
+        .execute(
+            &alice,
+            &id("slow"),
+            prepared,
+            ServiceMode::AsRequested,
+            live(),
+        )
+        .await
+        .unwrap()
+    {
+        Executed::Start(StartResult::Running { .. }) => {}
+        other => panic!("a detach request starts the operation, got {other:?}"),
+    }
+    let query = service
+        .prepare(&alice, Surface::Api, &id("read"), json!({}), |_| {
+            Shape::Direct
+        })
+        .await
+        .unwrap();
+    let refused = service
+        .execute(&alice, &id("read"), query, ServiceMode::Start, live())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::BadRequest);
+    f.release.notify_one();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_of_a_running_key_is_always_the_same_running_operation_whatever_the_scheduling() {
+    let f = fixture().await;
+    let service = Arc::new(f.service(all(Surface::Api)));
+    let alice = who("alice");
+    let StartResult::Running { operation } = service
+        .start(
+            &alice,
+            Surface::Api,
+            &id("slow"),
+            json!({}),
+            Some("k".into()),
+            live(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected running")
+    };
+    for round in 0..100 {
+        let retries: Vec<_> = (0..4)
+            .map(|_| {
+                let service = service.clone();
+                let alice = alice.clone();
+                tokio::spawn(async move {
+                    service
+                        .start(
+                            &alice,
+                            Surface::Api,
+                            &id("slow"),
+                            json!({}),
+                            Some("k".into()),
+                            live(),
+                        )
+                        .await
+                })
+            })
+            .collect();
+        for retry in retries {
+            match retry.await.unwrap() {
+                Ok(StartResult::Running { operation: second }) => {
+                    assert_eq!(second, operation, "round {round}")
+                }
+                other => {
+                    panic!("round {round}: expected the same running operation, got {other:?}")
+                }
+            }
+        }
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.release.notify_one();
+}
+
+#[tokio::test]
+async fn capability_names_must_be_addressable_on_every_surface() {
+    let f = fixture().await;
+    let ports = f.ports.clone();
+    let mut d = Dispatcher::new(ports.clone(), ports.clone(), ports.clone(), ports);
+    let work = || {
+        Arc::new(Work {
+            calls: f.calls.clone(),
+            seen: f.seen.clone(),
+            release: f.release.clone(),
+            mode: Mode::Immediate,
+        })
+    };
+    for bad in [
+        "",
+        "a/b",
+        "a b",
+        "a?x",
+        "a{b}",
+        "caf\u{e9}",
+        "herald.cancel",
+        "thing.v2",
+        "thing.v10",
+    ] {
+        let err = d
+            .register(contract(bad, Kind::Query, false), work())
+            .unwrap_err();
+        assert!(
+            matches!(err, DispatchError::InvalidName(_)),
+            "{bad:?} -> {err:?}"
+        );
+    }
+    for good in [
+        "read",
+        "a.b",
+        "a_b-c",
+        "v2",
+        "thing.version",
+        "thing.v",
+        "x.v2y",
+    ] {
+        d.register(contract(good, Kind::Query, false), work())
+            .unwrap_or_else(|e| panic!("{good:?} -> {e:?}"));
+    }
 }
