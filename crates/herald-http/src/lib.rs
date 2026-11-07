@@ -33,9 +33,9 @@ use axum::{
 };
 use herald::{
     CapabilityId, Kind,
+    contract_schema::{call_result, shared_schemas, start_result},
     exposure::Surface,
     runtime::OperationId,
-    contract_schema::{call_result, shared_schemas, start_result},
     schema_refs::lift_schema,
     service::{
         Descriptor, Executed, MAX_KEY_BYTES, MAX_REQUEST_BYTES, Mode, Service, Shape, StartResult,
@@ -310,9 +310,7 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
     let mut paths = serde_json::Map::new();
     let mut schemas = shared_schemas(BASE);
     let reference = |name: &str| json!({"$ref": format!("{BASE}{name}")});
-    let error = |description: &str| {
-        json!({"description": description, "content": {"application/json": {"schema": reference("ErrorResponse")}}})
-    };
+    let error = |description: &str| json!({"description": description, "content": {"application/json": {"schema": reference("ErrorResponse")}}});
     // Every failure is the same typed body; the status ranges say which kind.
     let failures = json!({
         "4XX": error("A typed error: the request was refused."),
@@ -331,9 +329,24 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
         // The position in the list names the components, since names the product chose can collide
         // once their punctuation is folded.
         let prefix = format!("c{index}");
-        let input = lift_schema(&d.input_schema, &format!("{prefix}_input"), &mut schemas, BASE);
-        let output = lift_schema(&d.output_schema, &format!("{prefix}_output"), &mut schemas, BASE);
-        let failure = lift_schema(&d.error_schema, &format!("{prefix}_error"), &mut schemas, BASE);
+        let input = lift_schema(
+            &d.input_schema,
+            &format!("{prefix}_input"),
+            &mut schemas,
+            BASE,
+        );
+        let output = lift_schema(
+            &d.output_schema,
+            &format!("{prefix}_output"),
+            &mut schemas,
+            BASE,
+        );
+        let failure = lift_schema(
+            &d.error_schema,
+            &format!("{prefix}_error"),
+            &mut schemas,
+            BASE,
+        );
         let mut properties = json!({"input": input});
         let mut required = vec!["input"];
         properties["idempotency_key"] = json!({"type": "string", "minLength": 1,
@@ -390,9 +403,7 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
         }
     }
     let id = json!({"name": "id", "in": "path", "required": true, "schema": {"type": "string"}});
-    let json_response = |description: &str, schema: Value| {
-        json!({"description": description, "content": {"application/json": {"schema": schema}}})
-    };
+    let json_response = |description: &str, schema: Value| json!({"description": description, "content": {"application/json": {"schema": schema}}});
     paths.insert(
         format!("{API_PREFIX}/capabilities"),
         json!({"get": {

@@ -27,9 +27,9 @@
 
 use herald::{
     Cancellation, CapabilityId, Kind,
+    contract_schema::{call_result, input_is_object, shared_schemas, start_result},
     exposure::Surface,
     runtime::OperationId,
-    contract_schema::{call_result, input_is_object, shared_schemas, start_result},
     schema_refs::{lift_schema, rewrite_refs},
     service::{Descriptor, Executed, MAX_KEY_BYTES, Mode, Principal, Service, Shape},
     wire::{ErrorCode, WireError},
