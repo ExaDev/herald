@@ -240,12 +240,22 @@ pub trait Observer: Send + Sync {
 /// The prefix adapters use for their own follow-up tools, so no capability may take it.
 pub const RESERVED_PREFIX: &str = "herald.";
 
+/// The longest tool name the MCP specification recommends (SEP-986: 1 to 64 characters). An MCP tool
+/// is `<name>.v<version>`, so a capability's name must leave room for that suffix.
+const MAX_TOOL_NAME_BYTES: usize = 64;
+
+/// The longest capability name: the tool-name bound less `.v` and the widest `u32` version.
+pub const MAX_NAME_BYTES: usize = MAX_TOOL_NAME_BYTES - ".v4294967295".len();
+
 /// A name is addressable on every surface: ASCII letters, digits, `_`, `-` and `.`, not reserved, and
 /// not ending in `.v<digits>`, which adapters read as a version suffix.
 fn validate_name(name: &str) -> Result<(), DispatchError> {
     let bad = |reason: &str| Err(DispatchError::InvalidName(format!("{name:?}: {reason}")));
     if name.is_empty() {
         return bad("empty");
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return bad("too long to be an MCP tool name with a version suffix");
     }
     if !name
         .bytes()

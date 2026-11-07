@@ -1309,7 +1309,12 @@ async fn capability_names_must_be_addressable_on_every_surface() {
             mode: Mode::Immediate,
         })
     };
+    let longest = "n".repeat(herald::MAX_NAME_BYTES);
+    d.register(contract(&longest, Kind::Query, false), work())
+        .expect("the longest name is accepted");
+    let too_long = "n".repeat(herald::MAX_NAME_BYTES + 1);
     for bad in [
+        too_long.as_str(),
         "",
         "a/b",
         "a b",
