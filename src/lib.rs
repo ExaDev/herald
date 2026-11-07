@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 
 pub mod exposure;
 pub mod runtime;
+pub mod schema_refs;
 pub mod service;
 pub mod wire;
 
@@ -60,6 +61,10 @@ pub struct Request {
     pub capability: CapabilityId,
     pub identity: String,
     pub input: Value,
+    /// Whether the transport claims the caller consented. The service never sets it from the wire
+    /// (it is always false there), so a product's [`Confirmer`] is the only authority on consent. The
+    /// confirmer runs before an idempotent replay is served, so replaying a completed operation that
+    /// requires confirmation asks the confirmer again and must be answerable more than once.
     pub confirmed: bool,
 }
 
