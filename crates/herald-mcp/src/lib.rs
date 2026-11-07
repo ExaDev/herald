@@ -12,8 +12,14 @@
 //!
 //! A tool-level failure is a result with `isError: true` and a typed [`WireError`]. A result whose
 //! operation reported an error outcome is also flagged, and one whose outcome is unknown carries
-//! `"uncertain": true` in its body, as it does on the HTTP API. A malformed request, such as
-//! arguments that are not an object, is an MCP protocol error.
+//! `"uncertain": true` in its body, as it does on the HTTP API. Both adapters build the body with
+//! [`Executed::body`](herald::service::Executed::body). Arguments the follow tools cannot read, such
+//! as a cursor that is not a non-negative integer, are typed `bad_request` results like any other
+//! refusal, so a model can read them and correct the call. Arguments that are not an object are an
+//! MCP protocol error, which the SDK raises before the handler runs.
+//!
+//! Every capability tool declares an output schema, built from the capability's own and the shared
+//! result shapes, so a client can check results the same way a client of the HTTP API can.
 //!
 //! The network transport is stateless: no session is created, so a session id cannot be stolen,
 //! replayed or used to end another caller's stream, and a caller cannot open sessions to exhaust the
@@ -23,11 +29,9 @@ use herald::{
     Cancellation, CapabilityId, Kind,
     exposure::Surface,
     runtime::OperationId,
-    schema_refs::rewrite_refs,
-    service::{
-        CallResult, Descriptor, Executed, MAX_KEY_BYTES, Mode, Principal, Service, Shape,
-        StartResult,
-    },
+    contract_schema::{call_result, input_is_object, shared_schemas, start_result},
+    schema_refs::{lift_schema, rewrite_refs},
+    service::{Descriptor, Executed, MAX_KEY_BYTES, Mode, Principal, Service, Shape},
     wire::{ErrorCode, WireError},
 };
 use herald_boundary::{Boundary, Guarded, error_response};
@@ -116,20 +120,6 @@ fn object(value: Value) -> Arc<Map<String, Value>> {
     }
 }
 
-/// Whether a schema can describe a JSON object, which is all an MCP tool's arguments can be.
-fn accepts_object(schema: &Value) -> bool {
-    match schema {
-        Value::Bool(allowed) => *allowed,
-        Value::Object(map) => match map.get("type") {
-            None => true,
-            Some(Value::String(t)) => t == "object",
-            Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
-            Some(_) => false,
-        },
-        _ => false,
-    }
-}
-
 /// The input schema as a tool exposes it: a query's own schema as it is, and an operation's wrapped
 /// with the idempotency key and the detach flag. Inside the wrapper the schema sits at
 /// `properties/input`, so its pointers to itself are moved there, and its definitions are hoisted to
@@ -202,6 +192,24 @@ fn tool_of(descriptor: &Descriptor) -> Tool {
         }),
         object(tool_input_schema(descriptor)),
     )
+    .with_raw_output_schema(object(tool_output_schema(descriptor)))
+}
+
+/// The output schema a capability tool declares: a result of the capability, or for an operation a
+/// start result too, or a typed error. The capability's own schemas and the shared shapes sit in
+/// `$defs` at the schema root, so every pointer resolves from there.
+pub fn tool_output_schema(descriptor: &Descriptor) -> Value {
+    const BASE: &str = "#/$defs/";
+    let mut defs = shared_schemas(BASE);
+    let output = lift_schema(&descriptor.output_schema, "output", &mut defs, BASE);
+    let error = lift_schema(&descriptor.error_schema, "error", &mut defs, BASE);
+    let result = call_result(&output, &error);
+    let mut results = vec![result.clone()];
+    if descriptor.kind == Kind::Operation {
+        results.push(start_result(&result));
+    }
+    results.push(json!({"$ref": format!("{BASE}ErrorResponse")}));
+    json!({"type": "object", "anyOf": results, "$defs": defs})
 }
 
 fn follow_tool(name: &'static str, description: &'static str, schema: Value) -> Tool {
@@ -222,35 +230,26 @@ fn not_found() -> CallToolResponse {
     failure(WireError::new(ErrorCode::NotFound, "no such capability"))
 }
 
-/// A completed call. A result whose operation reported an error outcome is flagged as a tool error,
-/// the same signal on every path. An unknown outcome is not an error: it carries `"uncertain": true`
-/// so a client sees the operation may have run.
-fn call_response(call: &CallResult) -> CallToolResponse {
-    let value = json!(call);
-    if call.failed {
-        CallToolResult::structured_error(value).into()
+/// A result, in the body every adapter shares. A result whose operation reported an error outcome
+/// is flagged as a tool error, the same signal on every path. An unknown outcome is not an error: it
+/// carries `"uncertain": true` so a client sees the operation may have run.
+fn executed_response(executed: &Executed) -> CallToolResponse {
+    if executed.failed() {
+        CallToolResult::structured_error(executed.body()).into()
     } else {
-        success(value)
+        success(executed.body())
     }
 }
 
-fn executed_response(executed: Executed) -> CallToolResponse {
-    match executed {
-        Executed::Call(call) => call_response(&call),
-        Executed::Start(StartResult::Finished(call)) => call_response(&call),
-        Executed::Start(running) => success(json!(running)),
-    }
+/// The text of a refused follow-tool argument, as a typed result.
+fn bad_argument(message: &'static str) -> CallToolResponse {
+    failure(WireError::new(ErrorCode::BadRequest, message))
 }
 
-fn string_arg<'a>(arguments: &'a Map<String, Value>, name: &str) -> Result<&'a str, McpError> {
-    arguments
-        .get(name)
-        .and_then(Value::as_str)
-        .ok_or_else(|| McpError::invalid_params(format!("`{name}` must be a string"), None))
-}
-
-/// A cancellation that fires when the protocol cancels the request. The returned guard stops the
-/// forwarding task when the call ends, so it never outlives the request.
+/// A cancellation that fires when the request's token does. Over stdio the protocol's cancel
+/// notification fires it. Over the stateless network transport the SDK ignores that notification, so
+/// the token fires when the client's connection ends. The returned guard stops the forwarding task
+/// when the call ends, so it never outlives the request.
 fn cancellation_from(context: &RequestContext<RoleServer>) -> (Cancellation, impl Drop) {
     struct Stop(tokio::task::JoinHandle<()>);
     impl Drop for Stop {
@@ -289,8 +288,8 @@ impl ServerHandler for HeraldMcp {
             .list(&principal, Surface::Mcp)
             .await
             .iter()
-            // A tool's arguments are an object, so a query whose input cannot be one is not offered.
-            .filter(|d| d.kind != Kind::Query || accepts_object(&d.input_schema))
+            // A tool's arguments are an object, so a query whose input is not declared to be one is not offered.
+            .filter(|d| d.kind != Kind::Query || input_is_object(d))
             .map(tool_of)
             .collect();
         tools.push(follow_tool(
@@ -331,18 +330,22 @@ impl ServerHandler for HeraldMcp {
         };
 
         if name == OPERATION_TOOL || name == EVENTS_TOOL {
-            let id = OperationId(string_arg(arguments, "id")?.to_owned());
+            let Some(id) = arguments.get("id").and_then(Value::as_str) else {
+                return Ok(bad_argument("`id` must be a string"));
+            };
+            let id = OperationId(id.to_owned());
             return Ok(if name == OPERATION_TOOL {
                 match self.service.operation(&principal, Surface::Mcp, &id).await {
                     Ok(view) => success(json!(view)),
                     Err(error) => failure(error),
                 }
             } else {
-                let cursor = match arguments.get("cursor") {
+                let cursor = match arguments.get("cursor").map(Value::as_u64) {
                     None => 0,
-                    Some(v) => v.as_u64().ok_or_else(|| {
-                        McpError::invalid_params("`cursor` must be a non-negative integer", None)
-                    })?,
+                    Some(Some(cursor)) => cursor,
+                    Some(None) => {
+                        return Ok(bad_argument("`cursor` must be a non-negative integer"));
+                    }
                 };
                 match self
                     .service
@@ -396,7 +399,7 @@ impl ServerHandler for HeraldMcp {
                 .execute(&principal, &capability, prepared, mode, cancellation)
                 .await
             {
-                Ok(executed) => executed_response(executed),
+                Ok(executed) => executed_response(&executed),
                 Err(error) => failure(error),
             },
         )

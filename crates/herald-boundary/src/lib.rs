@@ -1,7 +1,7 @@
 //! The edge every network adapter shares. It runs before any adapter logic: it rejects a request from
 //! a host or origin the product does not serve, then authenticates the caller, and only then hands the
-//! request on with a [`Principal`] that this crate constructed. Nothing the caller writes in a header or
-//! body can choose that identity.
+//! request on with the [`Principal`] the product's authenticator named, which this crate attaches to
+//! the request. Nothing the caller writes in a header or body can choose that identity.
 //!
 //! This crate defines the hooks. Credentials, tokens and how they are verified belong to the product,
 //! which supplies an [`Authenticator`].

@@ -1,8 +1,9 @@
 //! Herald capabilities as a versioned JSON API under `/v1`, behind the same boundary as the MCP
 //! network transport. Every handler calls [`Service`], so exposure, authorisation, consent,
-//! idempotency and error typing are the ones the MCP adapter has. Every failure, including a path,
-//! query or body that does not parse, a body that is too large and a route that does not exist, is a
-//! typed [`WireError`] as JSON.
+//! idempotency and error typing are the ones the MCP adapter has. Every failure the router itself
+//! produces, including a path, query or body that does not parse, a body that is too large and a
+//! route that does not exist, is a typed [`WireError`] as JSON. A connection the server refuses
+//! before it reaches the router, for example a malformed request line, is answered by the server.
 //!
 //! - `GET  /v1/capabilities`: the capabilities the caller may use.
 //! - `POST /v1/capabilities/{name}/{version}/call`: run to completion.
@@ -13,10 +14,12 @@
 //! A request body is `{"input": ..., "idempotency_key"?: ...}`. A completed call answers 200 with a
 //! [`CallResult`](herald::service::CallResult); one whose operation reported an error outcome is
 //! still a 200 carrying `"failed": true`, and one whose outcome is unknown carries `"uncertain": true`,
-//! exactly as the MCP adapter reports them. A started operation answers 202 with its id.
+//! exactly as the MCP adapter reports them. A started operation answers 202 with its id, or 200 with
+//! `"state": "finished"` and the call's result when it had already finished. Both adapters build the
+//! body with [`Executed::body`](herald::service::Executed::body).
 //!
-//! A `call` that the client abandons cancels the handler cooperatively. A `start` is detached and is
-//! never cancelled by its request.
+//! A `call` that the client abandons cancels the handler cooperatively, whether it is a query or an
+//! operation. A `start` is detached and is never cancelled by its request.
 
 use axum::{
     Extension, Json, Router,
@@ -32,7 +35,8 @@ use herald::{
     CapabilityId, Kind,
     exposure::Surface,
     runtime::OperationId,
-    schema_refs::rewrite_refs,
+    contract_schema::{call_result, shared_schemas, start_result},
+    schema_refs::lift_schema,
     service::{
         Descriptor, Executed, MAX_KEY_BYTES, MAX_REQUEST_BYTES, Mode, Service, Shape, StartResult,
     },
@@ -185,6 +189,10 @@ async fn run(
         Ok(path) => path,
         Err(rejection) => return bad_path(&rejection),
     };
+    // Bounds apply before the version is read, as they do for every name on MCP.
+    if let Err(error) = Service::check_bounds(&payload) {
+        return error_response(error);
+    }
     let capability = match capability(name, &version) {
         Ok(capability) => capability,
         Err(error) => return error_response(error),
@@ -200,7 +208,7 @@ async fn run(
     };
     // A call ends when the client goes away. A start outlives its request, so nothing cancels it.
     let (sender, cancellation) = herald::cancellation();
-    let _cancel_on_drop = (mode == Mode::Call && prepared.kind == Kind::Operation).then(|| {
+    let _cancel_on_drop = (mode == Mode::Call).then(|| {
         OnDrop(move || {
             let _ = sender.send(true);
         })
@@ -209,13 +217,13 @@ async fn run(
         .execute(&principal, &capability, prepared, mode, cancellation)
         .await
     {
-        Ok(Executed::Start(StartResult::Running { operation })) => (
-            StatusCode::ACCEPTED,
-            Json(json!(StartResult::Running { operation })),
-        )
-            .into_response(),
-        Ok(Executed::Start(finished)) => (StatusCode::OK, Json(json!(finished))).into_response(),
-        Ok(Executed::Call(call)) => (StatusCode::OK, Json(json!(call))).into_response(),
+        Ok(executed) => {
+            let status = match &executed {
+                Executed::Start(StartResult::Running { .. }) => StatusCode::ACCEPTED,
+                _ => StatusCode::OK,
+            };
+            (status, Json(executed.body())).into_response()
+        }
         Err(error) => error_response(error),
     }
 }
@@ -292,51 +300,30 @@ async fn openapi(
     .into_response()
 }
 
-/// Stores `schema` in `components` under `name`, with the definitions it carries beside it under
-/// names prefixed by `name`, and returns a reference to it. Every pointer inside it is rewritten to
-/// the component's new location, so `#`, `#/$defs/X` and `#/properties/y` still resolve.
-fn lift(schema: &Value, name: &str, components: &mut serde_json::Map<String, Value>) -> Value {
-    let mut schema = schema.clone();
-    let root = format!("#/components/schemas/{name}");
-    let rewrite = |reference: &str| -> Option<String> {
-        if reference == "#" {
-            return Some(root.clone());
-        }
-        for definitions in ["#/$defs/", "#/definitions/"] {
-            if let Some(segment) = reference.strip_prefix(definitions) {
-                return Some(format!("#/components/schemas/{name}_{segment}"));
-            }
-        }
-        reference
-            .strip_prefix("#/")
-            .map(|pointer| format!("{root}/{pointer}"))
-    };
-    if let Value::Object(map) = &mut schema {
-        for definitions in ["$defs", "definitions"] {
-            if let Some(Value::Object(found)) = map.remove(definitions) {
-                for (key, mut definition) in found {
-                    rewrite_refs(&mut definition, &rewrite);
-                    components.insert(format!("{name}_{key}"), definition);
-                }
-            }
-        }
-    }
-    rewrite_refs(&mut schema, &rewrite);
-    components.insert(name.to_owned(), schema);
-    json!({"$ref": root})
-}
-
 /// The OpenAPI 3.1 document for exactly the capabilities in `descriptors`, with `security` as the
-/// scheme the boundary's authenticator advertises. It is generated from the same contracts the
-/// handlers validate against, so the client contract cannot drift from them.
+/// scheme the boundary's authenticator advertises. Request and result shapes come from the same
+/// contracts the handlers validate against and from [`herald::contract_schema`], which is tested
+/// against real service values, and this crate's tests validate real responses against the
+/// document.
 pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
+    const BASE: &str = "#/components/schemas/";
     let mut paths = serde_json::Map::new();
-    let mut schemas = serde_json::Map::new();
+    let mut schemas = shared_schemas(BASE);
+    let reference = |name: &str| json!({"$ref": format!("{BASE}{name}")});
     let error = |description: &str| {
-        json!({
-            "description": description,
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}
-        })
+        json!({"description": description, "content": {"application/json": {"schema": reference("ErrorResponse")}}})
+    };
+    // Every failure is the same typed body; the status ranges say which kind.
+    let failures = json!({
+        "4XX": error("A typed error: the request was refused."),
+        "5XX": error("A typed error: the server could not complete the request."),
+        "default": error("A typed error.")
+    });
+    let with_failures = |mut responses: Value| {
+        for (status, response) in failures.as_object().expect("an object") {
+            responses[status] = response.clone();
+        }
+        responses
     };
     for (index, d) in descriptors.iter().enumerate() {
         let base = format!("{API_PREFIX}/capabilities/{}/{}", d.id.name, d.id.version);
@@ -344,15 +331,18 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
         // The position in the list names the components, since names the product chose can collide
         // once their punctuation is folded.
         let prefix = format!("c{index}");
-        let input = lift(&d.input_schema, &format!("{prefix}_input"), &mut schemas);
-        let output = lift(&d.output_schema, &format!("{prefix}_output"), &mut schemas);
-        let failure = lift(&d.error_schema, &format!("{prefix}_error"), &mut schemas);
+        let input = lift_schema(&d.input_schema, &format!("{prefix}_input"), &mut schemas, BASE);
+        let output = lift_schema(&d.output_schema, &format!("{prefix}_output"), &mut schemas, BASE);
+        let failure = lift_schema(&d.error_schema, &format!("{prefix}_error"), &mut schemas, BASE);
         let mut properties = json!({"input": input});
         let mut required = vec!["input"];
+        properties["idempotency_key"] = json!({"type": "string", "minLength": 1,
+            "description": format!("At most {MAX_KEY_BYTES} bytes. A retry with the same key replays the recorded outcome.")});
         if is_operation {
-            properties["idempotency_key"] = json!({"type": "string", "minLength": 1,
-                "description": format!("At most {MAX_KEY_BYTES} bytes. A retry with the same key replays the recorded outcome.")});
             required.push("idempotency_key");
+        } else {
+            properties["idempotency_key"]["description"] =
+                json!("Ignored: a query is not recorded.");
         }
         let body = json!({
             "required": true,
@@ -363,21 +353,7 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
                 "properties": properties
             }}}
         });
-        let result = json!({
-            "type": "object",
-            "required": ["outcome", "recorded"],
-            "properties": {
-                "operation": {"type": "string"},
-                "outcome": {"oneOf": [
-                    {"type": "object", "required": ["Success"], "additionalProperties": false, "properties": {"Success": output}},
-                    {"type": "object", "required": ["Error"], "additionalProperties": false, "properties": {"Error": failure}},
-                    {"type": "object", "required": ["Unknown"], "additionalProperties": false, "properties": {"Unknown": {}}}
-                ]},
-                "recorded": {"type": "boolean"},
-                "failed": {"type": "boolean"},
-                "uncertain": {"type": "boolean"}
-            }
-        });
+        let result = call_result(&output, &failure);
         let route = |id: String, summary: &str, responses: Value| {
             json!({
                 "operationId": id,
@@ -385,7 +361,7 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
                 "x-herald-kind": d.kind,
                 "x-herald-confirmation-required": d.confirmation_required,
                 "requestBody": body,
-                "responses": responses
+                "responses": with_failures(responses)
             })
         };
         paths.insert(
@@ -393,40 +369,57 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
             json!({"post": route(
                 format!("call_{}_v{}", d.id.name, d.id.version),
                 "Run to completion.",
-                json!({
-                    "200": {"description": "The outcome.", "content": {"application/json": {"schema": result}}},
-                    "default": error("A typed error.")
-                }),
+                json!({"200": {"description": "The outcome.", "content": {"application/json": {"schema": result}}}}),
             )}),
         );
         if is_operation {
+            let started = start_result(&result);
             paths.insert(
                 format!("{base}/start"),
                 json!({"post": route(
                     format!("start_{}_v{}", d.id.name, d.id.version),
                     "Start and follow.",
                     json!({
-                        "200": {"description": "Already finished.", "content": {"application/json": {"schema": result}}},
-                        "202": {"description": "Running; follow it by id.",
-                            "content": {"application/json": {"schema": {
-                                "type": "object",
-                                "required": ["state", "operation"],
-                                "properties": {"state": {"const": "running"}, "operation": {"type": "string"}}
-                            }}}},
-                        "default": error("A typed error.")
+                        "200": {"description": "Already finished: `state` is `finished`.",
+                            "content": {"application/json": {"schema": started}}},
+                        "202": {"description": "Running: `state` is `running`; follow it by id.",
+                            "content": {"application/json": {"schema": started}}}
                     }),
                 )}),
             );
         }
     }
     let id = json!({"name": "id", "in": "path", "required": true, "schema": {"type": "string"}});
+    let json_response = |description: &str, schema: Value| {
+        json!({"description": description, "content": {"application/json": {"schema": schema}}})
+    };
+    paths.insert(
+        format!("{API_PREFIX}/capabilities"),
+        json!({"get": {
+            "operationId": "list_capabilities",
+            "summary": "The capabilities the caller may use.",
+            "responses": with_failures(json!({"200": json_response(
+                "The capabilities, each with its schemas.",
+                json!({"type": "object", "required": ["capabilities"],
+                       "properties": {"capabilities": {"type": "array", "items": {"type": "object"}}}}),
+            )}))
+        }}),
+    );
+    paths.insert(
+        format!("{API_PREFIX}/openapi.json"),
+        json!({"get": {
+            "operationId": "get_openapi_document",
+            "summary": "This document, generated for the caller.",
+            "responses": with_failures(json!({"200": json_response("The document.", json!({"type": "object"}))}))
+        }}),
+    );
     paths.insert(
         format!("{API_PREFIX}/operations/{{id}}"),
         json!({"get": {
             "operationId": "get_operation",
             "summary": "Read an operation you started.",
             "parameters": [id],
-            "responses": {"200": {"description": "The operation."}, "default": error("A typed error.")}
+            "responses": with_failures(json!({"200": json_response("The operation.", reference("OperationView"))}))
         }}),
     );
     paths.insert(
@@ -440,24 +433,8 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
                  "schema": {"type": "integer", "minimum": 0, "default": 0},
                  "description": "The number of events already seen."}
             ],
-            "responses": {"200": {"description": "The events."}, "default": error("A typed error.")}
+            "responses": with_failures(json!({"200": json_response("The events.", reference("OperationEvents"))}))
         }}),
-    );
-    schemas.insert(
-        "ErrorResponse".to_owned(),
-        json!({
-            "type": "object",
-            "required": ["error"],
-            "properties": {"error": {
-                "type": "object",
-                "required": ["code", "message"],
-                "properties": {
-                    "code": {"type": "string"},
-                    "message": {"type": "string"},
-                    "detail": {}
-                }
-            }}
-        }),
     );
     json!({
         "openapi": "3.1.0",
