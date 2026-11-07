@@ -9,7 +9,7 @@ use herald::{
     runtime::{MemoryOperationStore, Runtime},
     service::{Principal, Service},
 };
-use herald_boundary::{Authenticator, Boundary, OriginPolicy};
+use herald_boundary::{Authentication, Authenticator, Boundary, Limits, OriginPolicy};
 use herald_mcp::{HeraldMcp, rmcp};
 use reqwest::{Client, Method, StatusCode};
 use rmcp::{ServiceExt, model::CallToolRequestParams};
@@ -22,6 +22,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Notify;
+
+/// Generous limits: these suites test behaviour, not load.
+fn limits() -> Limits {
+    Limits::new(Duration::from_secs(60), 64).unwrap()
+}
 
 const ORIGIN: &str = "https://app.example.test";
 
@@ -80,14 +85,15 @@ impl Handler for Work {
 }
 struct Tokens;
 impl Authenticator for Tokens {
-    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Option<Principal>> {
+    fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication> {
         Box::pin(async move {
-            match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
+            let principal: Option<Principal> = (|| match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
                 "Bearer alice-token" => Principal::new("alice").ok(),
                 "Bearer bob-token" => Principal::new("bob").ok(),
                 "Bearer mallory-token" => Principal::new("mallory").ok(),
                 _ => None,
-            }
+            })();
+            principal.into()
         })
     }
 }
@@ -159,7 +165,7 @@ async fn world() -> World {
     let port = listener.local_addr().unwrap().port();
     let origin_policy =
         OriginPolicy::new([format!("127.0.0.1:{port}")], [ORIGIN.to_string()]).unwrap();
-    let boundary = Boundary::new(Arc::new(Tokens), origin_policy);
+    let boundary = Boundary::new(Arc::new(Tokens), origin_policy, limits());
     let app = herald_http::router(service.clone(), boundary);
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())

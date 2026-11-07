@@ -291,45 +291,38 @@ async fn openapi(
     .into_response()
 }
 
-/// Moves a schema's `$defs` or `definitions` into `components` under names prefixed with `prefix`
-/// and points its references there, so the schema keeps resolving once it is embedded in the
-/// document. Returns the rewritten schema.
-fn lift(schema: &Value, prefix: &str, components: &mut serde_json::Map<String, Value>) -> Value {
-    fn rewrite(value: &mut Value, prefix: &str) {
-        match value {
-            Value::Object(map) => {
-                for (key, inner) in map.iter_mut() {
-                    if key == "$ref" {
-                        if let Value::String(reference) = inner {
-                            for root in ["#/$defs/", "#/definitions/"] {
-                                if let Some(name) = reference.strip_prefix(root) {
-                                    *reference = format!("#/components/schemas/{prefix}_{name}");
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        rewrite(inner, prefix);
-                    }
-                }
-            }
-            Value::Array(items) => items.iter_mut().for_each(|item| rewrite(item, prefix)),
-            _ => {}
-        }
-    }
+/// Stores `schema` in `components` under `name`, with the definitions it carries beside it under
+/// names prefixed by `name`, and returns a reference to it. Every pointer inside it is rewritten to
+/// the component's new location, so `#`, `#/$defs/X` and `#/properties/y` still resolve.
+fn lift(schema: &Value, name: &str, components: &mut serde_json::Map<String, Value>) -> Value {
     let mut schema = schema.clone();
+    let root = format!("#/components/schemas/{name}");
+    let rewrite = |reference: &str| -> Option<String> {
+        if reference == "#" {
+            return Some(root.clone());
+        }
+        for definitions in ["#/$defs/", "#/definitions/"] {
+            if let Some(segment) = reference.strip_prefix(definitions) {
+                return Some(format!("#/components/schemas/{name}_{segment}"));
+            }
+        }
+        reference
+            .strip_prefix("#/")
+            .map(|pointer| format!("{root}/{pointer}"))
+    };
     if let Value::Object(map) = &mut schema {
-        for root in ["$defs", "definitions"] {
-            if let Some(Value::Object(definitions)) = map.remove(root) {
-                for (name, mut definition) in definitions {
-                    rewrite(&mut definition, prefix);
-                    components.insert(format!("{prefix}_{name}"), definition);
+        for definitions in ["$defs", "definitions"] {
+            if let Some(Value::Object(found)) = map.remove(definitions) {
+                for (key, mut definition) in found {
+                    rewrite_refs(&mut definition, &rewrite);
+                    components.insert(format!("{name}_{key}"), definition);
                 }
             }
         }
     }
-    rewrite(&mut schema, prefix);
-    schema
+    rewrite_refs(&mut schema, &rewrite);
+    components.insert(name.to_owned(), schema);
+    json!({"$ref": root})
 }
 
 /// The OpenAPI 3.1 document for exactly the capabilities in `descriptors`, with `security` as the
@@ -344,10 +337,12 @@ pub fn document(descriptors: &[Descriptor], security: &Value) -> Value {
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}
         })
     };
-    for d in descriptors {
+    for (index, d) in descriptors.iter().enumerate() {
         let base = format!("{API_PREFIX}/capabilities/{}/{}", d.id.name, d.id.version);
         let is_operation = d.kind == Kind::Operation;
-        let prefix = format!("{}_v{}", d.id.name.replace(['.', '-'], "_"), d.id.version);
+        // The position in the list names the components, since names the product chose can collide
+        // once their punctuation is folded.
+        let prefix = format!("c{index}");
         let input = lift(&d.input_schema, &format!("{prefix}_input"), &mut schemas);
         let output = lift(&d.output_schema, &format!("{prefix}_output"), &mut schemas);
         let failure = lift(&d.error_schema, &format!("{prefix}_error"), &mut schemas);
