@@ -22,7 +22,7 @@ impl Authenticator for Tokens {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             (headers.get(header::AUTHORIZATION)?.to_str().ok()? == "Bearer good-token")
-                .then(|| Principal::new("alice"))
+                .then(|| Principal::new("alice").unwrap())
         })
     }
 }

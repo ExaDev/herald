@@ -64,6 +64,16 @@ impl OriginPolicy {
         Ok(Self { hosts, origins })
     }
 
+    /// The served hosts, for handing the same list to an SDK that also checks them.
+    pub fn hosts(&self) -> impl Iterator<Item = &str> {
+        self.hosts.iter().map(String::as_str)
+    }
+
+    /// The allowed origins, likewise.
+    pub fn origins(&self) -> impl Iterator<Item = &str> {
+        self.origins.iter().map(String::as_str)
+    }
+
     fn admits(&self, headers: &HeaderMap) -> bool {
         let host_ok = headers
             .get(header::HOST)
@@ -92,6 +102,10 @@ impl Boundary {
             authenticator,
             policy,
         })
+    }
+
+    pub fn policy(&self) -> &OriginPolicy {
+        &self.policy
     }
 
     /// Use with `axum::middleware::from_fn_with_state(boundary, Boundary::guard)`.
@@ -160,10 +174,10 @@ pub fn status_for(code: ErrorCode) -> StatusCode {
         SupportUnknown | Cancelled | Interrupted | Store => StatusCode::SERVICE_UNAVAILABLE,
         ConfirmationRequired => StatusCode::PRECONDITION_REQUIRED,
         InvalidInput => StatusCode::UNPROCESSABLE_ENTITY,
-        KeyConflict => StatusCode::CONFLICT,
+        KeyConflict | InProgress => StatusCode::CONFLICT,
         BadRequest => StatusCode::BAD_REQUEST,
         OutcomeLost => StatusCode::GATEWAY_TIMEOUT,
-        ContractViolation => StatusCode::BAD_GATEWAY,
+        ContractViolation | SourceFailed => StatusCode::BAD_GATEWAY,
     }
 }
 
