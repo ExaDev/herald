@@ -386,7 +386,7 @@ async fn an_operation_needs_a_key_replays_on_retry_and_rejects_a_changed_payload
         .await
         .unwrap();
     assert_eq!(first, again);
-    assert!(first.recorded && first.operation.is_some());
+    assert!(first.recorded == Some(true) && first.operation.is_some());
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     let clash = service
         .call(
@@ -911,7 +911,7 @@ async fn an_outcome_that_could_not_be_recorded_is_flagged_and_store_errors_stay_
         .await
         .unwrap();
     assert!(
-        !out.recorded,
+        out.recorded == Some(false),
         "the handler ran but its outcome was not stored"
     );
     // A store failure on a read reaches the client as a fixed message, never the store's own text.
@@ -1014,7 +1014,7 @@ async fn start_results_and_wire_errors_survive_a_serde_round_trip() {
     let finished = StartResult::Finished(CallResult {
         operation: None,
         outcome: Outcome::Success(json!({"a": 1})),
-        recorded: true,
+        recorded: Some(true),
         failed: false,
         uncertain: false,
     });
@@ -1448,4 +1448,171 @@ async fn a_validator_message_in_an_error_is_bounded_whatever_the_input() {
         detail.chars().all(|c| c == 'é'),
         "cut on a character boundary"
     );
+}
+
+#[tokio::test]
+async fn a_record_left_accepted_by_a_failed_write_reads_as_interrupted_not_as_still_running() {
+    let f = fixture_with(
+        false,
+        Arc::new(ForgetfulStore(MemoryOperationStore::default())),
+    )
+    .await;
+    let service = f.service(all(Surface::Api));
+    let alice = who("alice");
+    let call = || async {
+        service
+            .call(
+                &alice,
+                Surface::Api,
+                &id("write"),
+                json!({}),
+                Some("k".into()),
+                live(),
+            )
+            .await
+    };
+    assert_eq!(call().await.unwrap().recorded, Some(false));
+    // The handler is gone and its record is stuck at Accepted. A retry is told so, not that the key
+    // is still running, and the handler is not run again.
+    let retry = call().await.unwrap();
+    assert!(retry.uncertain, "{retry:?}");
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    let start = service
+        .start(
+            &alice,
+            Surface::Api,
+            &id("write"),
+            json!({}),
+            Some("k".into()),
+            live(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(start, StartResult::Finished(_)), "{start:?}");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_the_handler_task_too_and_leaves_the_store_free() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let started = service
+        .start(
+            &who("alice"),
+            Surface::Api,
+            &id("slow"),
+            json!({}),
+            Some("run".into()),
+            live(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(started, StartResult::Running { .. }));
+    drop(service);
+    let Fixture { runtime, .. } = f;
+    let runtime = Arc::try_unwrap(runtime)
+        .ok()
+        .expect("the only runtime handle");
+    tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
+        .await
+        .expect("shutdown stopped the handler and released the store");
+}
+
+/// Records every outcome it is told about.
+#[derive(Default)]
+struct Audit(Mutex<Vec<(String, Result<Outcome, DispatchError>)>>);
+impl Observer for Audit {
+    fn finished(&self, r: &Request, _: u64, result: &Result<Outcome, DispatchError>) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((r.identity.clone(), result.clone()));
+    }
+    fn subscription_opened(&self, _: &Request, _: u64, _: &Result<(), DispatchError>) {}
+}
+
+#[tokio::test]
+async fn a_denial_at_the_service_is_audited_like_an_in_process_denial() {
+    let ports = Arc::new(Ports {
+        allowed: &["alice"],
+        confirm: AtomicBool::new(true),
+        confirm_claimed: false,
+    });
+    let audit = Arc::new(Audit::default());
+    let mut d = Dispatcher::new(ports.clone(), ports.clone(), ports.clone(), audit.clone());
+    d.register(
+        contract("read", Kind::Query, false),
+        Arc::new(Work {
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(vec![])),
+            release: Arc::new(Notify::new()),
+            mode: Mode::Immediate,
+        }),
+    )
+    .unwrap();
+    let d = Arc::new(d);
+    let (runtime, _) = Runtime::open(d.clone(), Arc::new(MemoryOperationStore::default()))
+        .await
+        .unwrap();
+    let service = Service::new(
+        d,
+        Arc::new(runtime),
+        Exposure::none().allow(Surface::Api, id("read")),
+    );
+    for name in ["read", "nothing"] {
+        let error = service
+            .call(
+                &who("mallory"),
+                Surface::Api,
+                &id(name),
+                json!({}),
+                None,
+                live(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }
+    let log = audit.0.lock().unwrap();
+    assert_eq!(
+        *log,
+        vec![("mallory".to_string(), Err(DispatchError::Denied))],
+        "the denial of a real capability is recorded; an unknown name has no contract to deny"
+    );
+}
+
+#[tokio::test]
+async fn both_adapters_get_one_body_and_one_failure_signal_for_every_executed_result() {
+    let f = fixture().await;
+    let service = f.service(all(Surface::Api));
+    let alice = who("alice");
+    let run = |name: &'static str, mode: ServiceMode, detach: bool| {
+        let service = &service;
+        let alice = &alice;
+        async move {
+            let payload = json!({"input": {}, "idempotency_key": name, "detach": detach});
+            let prepared = service
+                .prepare(alice, Surface::Api, &id(name), payload, |_| Shape::Envelope)
+                .await
+                .unwrap();
+            service
+                .execute(alice, &id(name), prepared, mode, live())
+                .await
+                .unwrap()
+        }
+    };
+    let done = run("write", ServiceMode::Call, false).await;
+    assert_eq!(done.body()["outcome"]["Success"]["caller"], "alice");
+    assert!(!done.failed());
+    let failed = run("fails", ServiceMode::Call, false).await;
+    assert!(failed.failed());
+    let doubted = run("doubts", ServiceMode::Call, false).await;
+    assert!(!doubted.failed() && doubted.body()["uncertain"] == true);
+    // A start whose operation already finished is tagged `finished` and carries the call's flags.
+    let replay = run("fails", ServiceMode::Start, true).await;
+    assert_eq!(replay.body()["state"], "finished");
+    assert!(replay.failed());
+    let running = run("slow", ServiceMode::Start, true).await;
+    assert_eq!(running.body()["state"], "running");
+    assert!(!running.failed());
+    f.release.notify_one();
 }

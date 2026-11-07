@@ -33,9 +33,13 @@ pub enum ErrorCode {
     TimedOut,
     /// The request was interrupted before the handler started, so nothing ran.
     Interrupted,
-    /// The handler may have run and its outcome is unknown.
+    /// The handler may have run and its outcome is unknown. This is the same condition a handler
+    /// reports with an unknown outcome (a result flagged `uncertain`), reached because the caller
+    /// dropped the request or the handler panicked. A client treats the two alike: the effect may
+    /// have happened, so follow the operation by id before retrying.
     OutcomeLost,
-    /// The handler ran but its response broke the capability's contract.
+    /// The handler ran but its response broke the capability's contract. The effect may have
+    /// happened, as for `OutcomeLost`; the response is withheld because it cannot be trusted.
     ContractViolation,
     /// Storage failed.
     Store,

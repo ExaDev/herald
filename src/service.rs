@@ -20,12 +20,18 @@ pub const MAX_KEY_BYTES: usize = 256;
 pub const MAX_INPUT_BYTES: usize = 1 << 20;
 
 /// The largest raw request payload an adapter accepts before it has looked at the capability. It is
-/// the input bound plus room for an adapter's envelope (an idempotency key, a detach flag, field
-/// names), so a request whose input is within bounds is never refused for its wrapper alone.
-pub const MAX_REQUEST_BYTES: usize = MAX_INPUT_BYTES + 4096;
+/// the input bound plus room for an adapter's envelope, so a request whose input is within bounds is
+/// never refused for its wrapper alone.
+pub const MAX_REQUEST_BYTES: usize = MAX_INPUT_BYTES + ENVELOPE_ALLOWANCE_BYTES;
 
-/// An authenticated caller. Only an adapter that has authenticated the caller constructs one, and its
-/// identity replaces anything the caller claims about itself.
+/// What an envelope adds around its input: a full-length key (JSON writes a control character as a
+/// six-byte `\u00XX` escape, so six times its length at worst), and the field names and punctuation
+/// of `idempotency_key`, `input` and `detach`.
+const ENVELOPE_ALLOWANCE_BYTES: usize = 6 * MAX_KEY_BYTES + 128;
+
+/// An authenticated caller. Construct one only from a verified credential, in the product's
+/// authenticator or at a transport whose peer the product chose (a stdio parent): its identity
+/// replaces anything the caller claims about itself, and nothing in this crate checks how it was made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal(String);
 
@@ -66,8 +72,10 @@ pub struct CallResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<OperationId>,
     pub outcome: Outcome,
-    /// False when the handler ran but its outcome could not be recorded.
-    pub recorded: bool,
+    /// For an operation, false when the handler ran but its outcome could not be recorded. Absent for
+    /// a query, which is never recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<bool>,
     /// The handler reported an error outcome. Adapters mirror this in their own failure signal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub failed: bool,
@@ -78,7 +86,7 @@ pub struct CallResult {
 }
 
 impl CallResult {
-    fn new(operation: Option<OperationId>, outcome: Outcome, recorded: bool) -> Self {
+    fn new(operation: Option<OperationId>, outcome: Outcome, recorded: Option<bool>) -> Self {
         let failed = matches!(outcome, Outcome::Error(_));
         let uncertain = matches!(outcome, Outcome::Unknown(_));
         Self {
@@ -138,11 +146,30 @@ pub enum Mode {
 }
 
 /// What running a prepared request produced.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Executed {
     Call(CallResult),
     Start(StartResult),
+}
+
+impl Executed {
+    /// The JSON body every adapter returns for this result, so the two cannot describe one result
+    /// differently: a call is its [`CallResult`], a start is its [`StartResult`] (tagged by `state`).
+    pub fn body(&self) -> Value {
+        match self {
+            Self::Call(call) => serde_json::json!(call),
+            Self::Start(start) => serde_json::json!(start),
+        }
+    }
+
+    /// Whether the operation reported an error outcome, which adapters mirror in their own failure
+    /// signal. A running operation has not failed, and an unknown outcome is not a failure.
+    pub fn failed(&self) -> bool {
+        match self {
+            Self::Call(call) | Self::Start(StartResult::Finished(call)) => call.failed,
+            Self::Start(StartResult::Running { .. }) => false,
+        }
+    }
 }
 
 /// How a started operation stands.
@@ -151,7 +178,8 @@ pub enum Executed {
 pub enum StartResult {
     /// Running on its own task: follow it with [`Service::operation`] and [`Service::events_after`].
     Running { operation: OperationId },
-    /// Already finished, or turned away before it could run detached.
+    /// Already finished when the request was served: a replay of a completed operation, or one that
+    /// finished before it could be reported as running.
     Finished(CallResult),
 }
 
@@ -202,9 +230,10 @@ impl Service {
     /// then looks at the payload's shape. A caller the product has denied therefore sees the same
     /// `NotFound` for an exposed capability, an unexposed one and an unknown one, whatever it sends.
     ///
-    /// The order is fixed because each step must not reveal more than the one before it allows:
-    /// size bounds apply to every payload alike, exposure is next, then authorisation against the
-    /// input the payload names (read leniently, since it is not yet validated), then the strict shape.
+    /// The order is fixed because each step must not reveal more than the one before it allows: the
+    /// request-level size bound applies to every payload alike, exposure is next, then authorisation
+    /// against the input the payload names (read leniently, since it is not yet validated), then the
+    /// strict shape, the key length and the input bound, which only an authorised caller is told about.
     pub async fn prepare(
         &self,
         principal: &Principal,
@@ -282,7 +311,7 @@ impl Service {
                     .dispatch(request, cancellation)
                     .await
                     .map_err(|e| dispatch_error(&e))?;
-                Ok(Executed::Call(CallResult::new(None, outcome, false)))
+                Ok(Executed::Call(CallResult::new(None, outcome, None)))
             }
             Kind::Operation if start => {
                 let key = require_key(prepared.key)?;
@@ -416,11 +445,12 @@ impl Service {
 
     /// A caller the product does not authorise for this request sees what an unknown capability shows.
     async fn admit(&self, request: &Request) -> Result<(), WireError> {
-        if self.dispatcher.authorise(request).await {
-            Ok(())
-        } else {
-            Err(not_found())
-        }
+        // The refusal is reported to the product's observer as a denial, and the caller sees an
+        // unknown capability.
+        self.dispatcher
+            .admit(request)
+            .await
+            .map_err(|_| not_found())
     }
 
     /// An unexposed capability and an unknown one are indistinguishable.
@@ -486,7 +516,7 @@ fn finished(submission: crate::runtime::Submission) -> Result<CallResult, WireEr
         Ok(outcome) => Ok(CallResult::new(
             Some(submission.id),
             outcome,
-            submission.record_error.is_none(),
+            Some(submission.record_error.is_none()),
         )),
         Err(error) => Err(dispatch_error(&error)),
     }

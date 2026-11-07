@@ -48,3 +48,44 @@ pub fn rewrite_refs(schema: &mut Value, rewrite: &dyn Fn(&str) -> Option<String>
         _ => {}
     }
 }
+
+/// Stores `schema` in `store` under `name`, with the definitions it carries beside it under
+/// `<name>_<definition>`, and returns a reference to it. `base` is where `store` is reachable from
+/// the final document root (`#/components/schemas/` or `#/$defs/`). Every pointer inside the schema is
+/// rewritten to its new location, so `#`, `#/$defs/X`, `#/definitions/X` and `#/properties/y` still
+/// resolve. `name` must be unique within `store`.
+pub fn lift_schema(
+    schema: &Value,
+    name: &str,
+    store: &mut serde_json::Map<String, Value>,
+    base: &str,
+) -> Value {
+    let mut schema = schema.clone();
+    let root = format!("{base}{name}");
+    let rewrite = |reference: &str| -> Option<String> {
+        if reference == "#" {
+            return Some(root.clone());
+        }
+        for definitions in ["#/$defs/", "#/definitions/"] {
+            if let Some(segment) = reference.strip_prefix(definitions) {
+                return Some(format!("{base}{name}_{segment}"));
+            }
+        }
+        reference
+            .strip_prefix("#/")
+            .map(|pointer| format!("{root}/{pointer}"))
+    };
+    if let Value::Object(map) = &mut schema {
+        for definitions in ["$defs", "definitions"] {
+            if let Some(Value::Object(found)) = map.remove(definitions) {
+                for (key, mut definition) in found {
+                    rewrite_refs(&mut definition, &rewrite);
+                    store.insert(format!("{name}_{key}"), definition);
+                }
+            }
+        }
+    }
+    rewrite_refs(&mut schema, &rewrite);
+    store.insert(name.to_owned(), schema);
+    serde_json::json!({ "$ref": root })
+}

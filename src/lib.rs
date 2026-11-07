@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
+pub mod contract_schema;
 pub mod exposure;
 pub mod runtime;
 pub mod schema_refs;
@@ -410,6 +411,20 @@ impl Dispatcher {
             Some(entry) => self.authorizer.authorize(request, &entry.contract).await,
             None => false,
         }
+    }
+
+    /// As [`Dispatcher::authorise`], and reports a refusal to the observer as `Denied`, the same
+    /// record in-process dispatch leaves, so a remote caller's denials are audited too. An unknown
+    /// capability is not reported: there is no contract to deny.
+    pub async fn admit(&self, request: &Request) -> Result<(), DispatchError> {
+        if self.authorise(request).await {
+            return Ok(());
+        }
+        if self.entries.contains_key(&request.capability) {
+            self.observer
+                .finished(request, self.clock.now(), &Err(DispatchError::Denied));
+        }
+        Err(DispatchError::Denied)
     }
 
     /// Returns registered contracts. Exposure policy must be applied by the caller.

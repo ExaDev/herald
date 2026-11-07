@@ -45,3 +45,40 @@ fn a_reference_the_rewrite_declines_is_unchanged() {
     rewrite_refs(&mut schema, &to_components);
     assert_eq!(schema["$ref"], "#");
 }
+
+#[test]
+fn a_lifted_schema_and_its_definitions_resolve_from_the_new_base() {
+    use herald::schema_refs::lift_schema;
+    let schema = json!({
+        "type": "object",
+        "properties": {"p": {"$ref": "#/$defs/P"}, "me": {"$ref": "#"}, "q": {"$ref": "#/properties/p"}},
+        "$defs": {"P": {"properties": {"back": {"$ref": "#"}, "d": {"$ref": "#/definitions/D"}}}},
+        "definitions": {"D": {"type": "integer"}}
+    });
+    let mut store = serde_json::Map::new();
+    let reference = lift_schema(&schema, "c0_input", &mut store, "#/components/schemas/");
+    assert_eq!(reference, json!({"$ref": "#/components/schemas/c0_input"}));
+    let root = &store["c0_input"];
+    assert!(root.get("$defs").is_none() && root.get("definitions").is_none());
+    assert_eq!(
+        root["properties"]["p"]["$ref"],
+        "#/components/schemas/c0_input_P"
+    );
+    assert_eq!(
+        root["properties"]["me"]["$ref"],
+        "#/components/schemas/c0_input"
+    );
+    assert_eq!(
+        root["properties"]["q"]["$ref"],
+        "#/components/schemas/c0_input/properties/p"
+    );
+    assert_eq!(
+        store["c0_input_P"]["properties"]["back"]["$ref"],
+        "#/components/schemas/c0_input"
+    );
+    assert_eq!(
+        store["c0_input_P"]["properties"]["d"]["$ref"],
+        "#/components/schemas/c0_input_D"
+    );
+    assert_eq!(store["c0_input_D"]["type"], "integer");
+}
