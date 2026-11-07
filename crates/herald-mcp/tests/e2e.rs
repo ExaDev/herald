@@ -67,15 +67,21 @@ enum Behaviour {
 
 struct Work {
     calls: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
     release: Option<Arc<Notify>>,
     behaviour: Behaviour,
 }
 impl Handler for Work {
-    fn invoke<'a>(&'a self, r: &'a Request, _: Cancellation) -> PortFuture<'a, Outcome> {
+    fn invoke<'a>(&'a self, r: &'a Request, mut cancel: Cancellation) -> PortFuture<'a, Outcome> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(release) = &self.release {
-                release.notified().await;
+                tokio::select! {
+                    () = release.notified() => {}
+                    () = cancel.cancelled() => {
+                        self.cancelled.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
             }
             let body = json!({"caller": r.identity, "input": r.input});
             match self.behaviour {
@@ -92,11 +98,12 @@ struct Tokens;
 impl Authenticator for Tokens {
     fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication> {
         Box::pin(async move {
-            let principal: Option<Principal> = (|| match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
-                "Bearer alice-token" => Principal::new("alice").ok(),
-                "Bearer mallory-token" => Principal::new("mallory").ok(),
-                _ => None,
-            })();
+            let principal: Option<Principal> =
+                (|| match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
+                    "Bearer alice-token" => Principal::new("alice").ok(),
+                    "Bearer mallory-token" => Principal::new("mallory").ok(),
+                    _ => None,
+                })();
             principal.into()
         })
     }
@@ -125,6 +132,7 @@ fn contract(name: &str, kind: Kind) -> Contract {
 struct World {
     service: Arc<Service>,
     calls: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
     release: Arc<Notify>,
     url: String,
     _server: tokio::task::JoinHandle<()>,
@@ -133,6 +141,7 @@ struct World {
 async fn world() -> World {
     let policy = Arc::new(Policy);
     let (calls, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+    let cancelled = Arc::new(AtomicUsize::new(0));
     let mut d = Dispatcher::new(policy.clone(), policy.clone(), policy.clone(), policy);
     for (name, kind, wait, behaviour) in [
         ("read", Kind::Query, false, Behaviour::Succeed),
@@ -145,6 +154,7 @@ async fn world() -> World {
             contract(name, kind),
             Arc::new(Work {
                 calls: calls.clone(),
+                cancelled: cancelled.clone(),
                 release: wait.then(|| release.clone()),
                 behaviour,
             }),
@@ -163,7 +173,10 @@ async fn world() -> World {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let policy = OriginPolicy::new([format!("127.0.0.1:{port}")], [ORIGIN.to_string()]).unwrap();
-    let app = router(service.clone(), Boundary::new(Arc::new(Tokens), policy, limits()));
+    let app = router(
+        service.clone(),
+        Boundary::new(Arc::new(Tokens), policy, limits()),
+    );
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
             .await
@@ -172,6 +185,7 @@ async fn world() -> World {
     World {
         service,
         calls,
+        cancelled,
         release,
         url: format!("http://127.0.0.1:{port}/mcp"),
         _server: server,
@@ -503,26 +517,51 @@ async fn an_error_outcome_is_flagged_and_an_unknown_one_is_marked_uncertain_on_b
 #[tokio::test]
 async fn an_oversized_request_gets_one_answer_whatever_it_names() {
     let world = world().await;
+    let huge = "x".repeat(herald::service::MAX_REQUEST_BYTES);
+    let long_key = "k".repeat(herald::service::MAX_KEY_BYTES + 1);
     for client in [
         stdio_client(&world, "alice").await,
         stdio_client(&world, "mallory").await,
-        network_client(&world, "mallory-token").await,
     ] {
-        let huge_key = "k".repeat(300);
+        // Over the request bound: judged before any lookup, so every name gives the same answer.
         let mut answers = Vec::new();
         for tool in ["write.v1", "nothing.v1", "read.v1"] {
             let result = call(
                 &client,
                 tool,
-                json!({"idempotency_key": huge_key, "input": {}}),
+                json!({"idempotency_key": "k", "input": {"blob": huge}}),
             )
             .await;
             assert!(is_error(&result));
             answers.push(structured(&result));
         }
         assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
-        assert_eq!(answers[0]["error"]["code"], "bad_request");
+        assert_eq!(answers[0]["error"]["code"], "too_large");
     }
+    // On the network the transport enforces the same bound before the handler runs, as a typed 413.
+    let response = reqwest::Client::new()
+        .post(&world.url)
+        .header("authorization", "Bearer mallory-token")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(format!("{{\"pad\":\"{huge}\"}}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 413);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "too_large");
+    // A key over its bound is judged after authorisation: a denied caller and an unknown tool
+    // look the same, and only an authorised caller is told.
+    let mallory = stdio_client(&world, "mallory").await;
+    let alice = stdio_client(&world, "alice").await;
+    let arguments = json!({"idempotency_key": long_key, "input": {}});
+    let denied = structured(&call(&mallory, "write.v1", arguments.clone()).await);
+    let unknown = structured(&call(&mallory, "nothing.v1", arguments.clone()).await);
+    assert_eq!(denied, unknown);
+    assert_eq!(denied["error"]["code"], "not_found");
+    let told = call(&alice, "write.v1", arguments).await;
+    assert_eq!(error_code(&told), "too_large");
     assert_eq!(world.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -657,4 +696,134 @@ async fn the_unguarded_routes_refuse_every_call_because_no_boundary_named_a_call
     let client = client.expect("the SDK admits a host in its list; the handler refuses the call");
     assert!(client.list_all_tools().await.is_err());
     assert_eq!(world.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn refusals_from_the_sdk_and_unmatched_paths_are_typed_errors() {
+    let world = world().await;
+    let base = world.url.trim_end_matches("/mcp").to_owned();
+    let client = reqwest::Client::new();
+    let authed =
+        |request: reqwest::RequestBuilder| request.header("authorization", "Bearer alice-token");
+    // The SDK refuses a GET on a stateless service, and a POST with the wrong media type.
+    for request in [
+        authed(client.get(format!("{base}/mcp"))),
+        authed(client.post(format!("{base}/mcp")))
+            .header("content-type", "text/plain")
+            .header("accept", "application/json, text/event-stream")
+            .body("x"),
+        authed(client.get(format!("{base}/mcp/anything"))),
+        authed(client.get(format!("{base}/elsewhere"))),
+    ] {
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        assert!(status.is_client_error(), "{status}");
+        let content_type = response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{status} {content_type}"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"]["code"].is_string(), "{status} {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_tool_schema_keeps_its_own_pointers_valid_once_nested_in_the_operation_wrapper() {
+    let descriptor = herald::service::Descriptor {
+        id: id("shape"),
+        kind: Kind::Operation,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "point": {"$ref": "#/$defs/Point"},
+                "next": {"$ref": "#"},
+                "again": {"$ref": "#/properties/point"}
+            },
+            "$defs": {"Point": {"type": "object", "properties": {"back": {"$ref": "#"}}}}
+        }),
+        output_schema: json!({"type": "object"}),
+        error_schema: json!({"type": "object"}),
+        confirmation_required: false,
+        support: Support::Supported,
+    };
+    let schema = herald_mcp::tool_input_schema(&descriptor);
+    assert!(schema["properties"]["input"].get("$defs").is_none());
+    assert_eq!(
+        schema["$defs"]["Point"]["properties"]["back"]["$ref"],
+        "#/properties/input"
+    );
+    let input = &schema["properties"]["input"]["properties"];
+    assert_eq!(input["point"]["$ref"], "#/$defs/Point");
+    assert_eq!(input["next"]["$ref"], "#/properties/input");
+    assert_eq!(
+        input["again"]["$ref"],
+        "#/properties/input/properties/point"
+    );
+}
+
+#[tokio::test]
+async fn a_network_call_the_client_abandons_cancels_the_handler_and_a_detached_start_survives() {
+    let world = world().await;
+    let rpc = |id: u64, tool: &str, arguments: Value| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+               "params": {"name": tool, "arguments": arguments}})
+    };
+    let post = |client: &reqwest::Client, body: Value| {
+        client
+            .post(&world.url)
+            .header("authorization", "Bearer alice-token")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&body)
+            .send()
+    };
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let abandoned = post(
+        &impatient,
+        rpc(
+            1,
+            "slow.v1",
+            json!({"idempotency_key": "abandon", "input": {}}),
+        ),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the client gave up");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while world.cancelled.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the handler was told the caller went away");
+
+    let before = world.cancelled.load(Ordering::SeqCst);
+    let patient = reqwest::Client::new();
+    let started = post(
+        &patient,
+        rpc(
+            2,
+            "slow.v1",
+            json!({"idempotency_key": "detached", "input": {}, "detach": true}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.status().as_u16(), 200);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    world.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        world.cancelled.load(Ordering::SeqCst),
+        before,
+        "ending the start request did not cancel the detached operation"
+    );
 }

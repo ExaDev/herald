@@ -160,7 +160,11 @@ fn is_host(value: &str) -> bool {
                 || b.is_ascii_digit()
                 || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
         })
-        && authority.port().is_none_or(|_| authority.port_u16().is_some())
+        // `Authority` reads an out-of-range port as no port, so the digits are checked here. The
+        // text after the last colon is a port unless that colon is inside an IPv6 literal.
+        && value
+            .rsplit_once(':')
+            .is_none_or(|(_, port)| port.contains(']') || port.parse::<u16>().is_ok())
 }
 
 fn is_origin(value: &str) -> bool {
@@ -248,10 +252,7 @@ impl Boundary {
     ) -> Response {
         // Shed load before reading anything: an unauthenticated caller costs a permit, nothing more.
         let mut response = match boundary.in_flight.clone().try_acquire_owned() {
-            Err(_) => error_response(WireError::new(
-                ErrorCode::Unavailable,
-                "the server is busy",
-            )),
+            Err(_) => error_response(WireError::new(ErrorCode::Unavailable, "the server is busy")),
             Ok(_permit) => {
                 // The permit is held until the response is built; the deadline covers the handler.
                 match tokio::time::timeout(
@@ -300,7 +301,13 @@ impl Boundary {
             ));
         }
         // A repeated Authorization is ambiguous, and a front proxy may pick a different one.
-        let authentication = if request.headers().get_all(header::AUTHORIZATION).iter().count() > 1 {
+        let authentication = if request
+            .headers()
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count()
+            > 1
+        {
             Authentication::Rejected
         } else {
             self.authenticator.authenticate(request.headers()).await

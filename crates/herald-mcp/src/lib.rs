@@ -130,10 +130,11 @@ fn accepts_object(schema: &Value) -> bool {
     }
 }
 
-/// The input schema as a tool exposes it: the capability's own schema, verbatim, and for an operation
-/// wrapped with the idempotency key. Definitions the schema refers to are hoisted to the wrapper root
-/// so a `#/$defs/...` reference still resolves after nesting.
-fn tool_input_schema(descriptor: &Descriptor) -> Value {
+/// The input schema as a tool exposes it: a query's own schema as it is, and an operation's wrapped
+/// with the idempotency key and the detach flag. Inside the wrapper the schema sits at
+/// `properties/input`, so its pointers to itself are moved there, and its definitions are hoisted to
+/// the wrapper root so `#/$defs/...` pointers resolve unchanged.
+pub fn tool_input_schema(descriptor: &Descriptor) -> Value {
     match descriptor.kind {
         Kind::Operation => {
             let mut input = descriptor.input_schema.clone();
@@ -453,7 +454,10 @@ pub fn routes(service: Arc<Service>, boundary: &Boundary) -> axum::Router {
 /// the capability named, so they leak nothing, but a client expects every failure to be a typed
 /// error: the status stays and the body becomes one. A JSON body, such as the SDK's own JSON-RPC
 /// error, is already structured and passes through.
-async fn typed_errors(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+async fn typed_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     let response = next.run(request).await;
     let status = response.status();

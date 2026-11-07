@@ -28,7 +28,9 @@ impl Authenticator for Tokens {
     fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+            if headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
                 == Some("Bearer good-token")
             {
                 Authentication::Authenticated(Principal::new("alice").unwrap())
@@ -360,7 +362,10 @@ async fn a_handler_behind_no_boundary_fails_loudly_instead_of_guessing_an_identi
     );
     let response = router.oneshot(request(&[])).await.unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body(response).await.contains("contract_violation"), "typed, not plain text");
+    assert!(
+        body(response).await.contains("contract_violation"),
+        "typed, not plain text"
+    );
 }
 
 /// Adding a code without deciding its status fails to compile here, and the table pins every status.
@@ -436,7 +441,10 @@ async fn a_host_header_and_a_uri_authority_that_disagree_are_refused() {
         .header("authorization", "Bearer good-token")
         .body(Body::empty())
         .unwrap();
-    assert_eq!(app(tokens()).oneshot(agree).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app(tokens()).oneshot(agree).await.unwrap().status(),
+        StatusCode::OK
+    );
     for (uri, host) in [
         ("http://evil.test/whoami", "api.example.test"),
         ("http://api.example.test/whoami", "evil.test"),
@@ -545,7 +553,11 @@ async fn requests_beyond_the_in_flight_limit_are_shed_at_once_and_a_permit_frees
             }
         }),
     );
-    let router = app_with(tokens(), Limits::new(Duration::from_secs(30), 1).unwrap(), routes);
+    let router = app_with(
+        tokens(),
+        Limits::new(Duration::from_secs(30), 1).unwrap(),
+        routes,
+    );
     let first = tokio::spawn(router.clone().oneshot(request(&[GOOD])));
     tokio::task::yield_now().await;
     // The second request arrives while the first holds the only permit, even though it carries no
@@ -561,7 +573,11 @@ async fn requests_beyond_the_in_flight_limit_are_shed_at_once_and_a_permit_frees
     gate.notify_one();
     assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
     let after = router.clone().oneshot(request(&[])).await.unwrap();
-    assert_eq!(after.status(), StatusCode::UNAUTHORIZED, "the permit was released");
+    assert_eq!(
+        after.status(),
+        StatusCode::UNAUTHORIZED,
+        "the permit was released"
+    );
 }
 
 #[test]
@@ -586,10 +602,22 @@ fn entries_a_browser_could_never_match_or_that_are_not_authorities_are_rejected(
     ] {
         assert!(origins(bad).is_err(), "{bad}");
     }
-    for good in ["https://a.test", "https://a.test:8443", "http://a.test:443", "https://[::1]:8443"] {
+    for good in [
+        "https://a.test",
+        "https://a.test:8443",
+        "http://a.test:443",
+        "https://[::1]:8443",
+    ] {
         assert!(origins(good).is_ok(), "{good}");
     }
-    for bad in ["a:b:c", "h.test:99999", "user@h.test", "h.test:", "[", ":80"] {
+    for bad in [
+        "a:b:c",
+        "h.test:99999",
+        "user@h.test",
+        "h.test:",
+        "[",
+        ":80",
+    ] {
         assert!(
             OriginPolicy::new([bad.to_string()], Vec::<String>::new()).is_err(),
             "{bad}"
@@ -614,5 +642,8 @@ async fn every_answer_carries_nosniff_and_keeps_a_vary_the_route_set() {
         .iter()
         .map(|v| v.to_str().unwrap().to_owned())
         .collect();
-    assert!(vary.contains(&"Accept".to_string()) && vary.contains(&"Authorization".to_string()), "{vary:?}");
+    assert!(
+        vary.contains(&"Accept".to_string()) && vary.contains(&"Authorization".to_string()),
+        "{vary:?}"
+    );
 }

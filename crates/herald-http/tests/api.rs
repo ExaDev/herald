@@ -87,12 +87,13 @@ struct Tokens;
 impl Authenticator for Tokens {
     fn authenticate<'a>(&'a self, headers: &'a HeaderMap) -> PortFuture<'a, Authentication> {
         Box::pin(async move {
-            let principal: Option<Principal> = (|| match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
-                "Bearer alice-token" => Principal::new("alice").ok(),
-                "Bearer bob-token" => Principal::new("bob").ok(),
-                "Bearer mallory-token" => Principal::new("mallory").ok(),
-                _ => None,
-            })();
+            let principal: Option<Principal> =
+                (|| match headers.get(header::AUTHORIZATION)?.to_str().ok()? {
+                    "Bearer alice-token" => Principal::new("alice").ok(),
+                    "Bearer bob-token" => Principal::new("bob").ok(),
+                    "Bearer mallory-token" => Principal::new("mallory").ok(),
+                    _ => None,
+                })();
             principal.into()
         })
     }
@@ -557,17 +558,24 @@ async fn an_operation_started_over_mcp_is_followed_over_http_and_the_two_agree()
     assert_eq!(over_http.body, over_mcp.structured_content.unwrap());
 }
 
+/// The component a `{"$ref": "#/components/schemas/<name>"}` points at.
+fn component<'a>(doc: &'a Value, reference: &Value) -> &'a Value {
+    let name = reference["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .unwrap_or_else(|| panic!("not a component reference: {reference}"));
+    &doc["components"]["schemas"][name]
+}
+
 #[tokio::test]
 async fn the_openapi_document_is_generated_for_the_caller_from_the_contracts() {
     let w = world().await;
     let doc = w.get("alice-token", "/openapi.json").await.body;
     assert_eq!(doc["openapi"], "3.1.0");
     let call = &doc["paths"]["/v1/capabilities/write/1/call"]["post"];
-    assert_eq!(
-        call["requestBody"]["content"]["application/json"]["schema"]["properties"]["input"]["properties"]
-            ["x"]["type"],
-        "integer"
-    );
+    let input =
+        &call["requestBody"]["content"]["application/json"]["schema"]["properties"]["input"];
+    assert_eq!(component(&doc, input)["properties"]["x"]["type"], "integer");
     assert_eq!(call["operationId"], "call_write_v1");
     assert!(
         doc["paths"]["/v1/capabilities/write/1/start"].is_object(),
@@ -845,15 +853,13 @@ fn the_document_keeps_schema_references_resolvable_and_advertises_the_boundary_s
     let body = &doc["paths"]["/v1/capabilities/shape/1/call"]["post"]["requestBody"]["content"]["application/json"]
         ["schema"];
     assert_eq!(body["required"], json!(["input", "idempotency_key"]));
-    let reference = body["properties"]["input"]["properties"]["point"]["$ref"]
-        .as_str()
-        .unwrap();
-    let target = reference.strip_prefix("#/components/schemas/").unwrap();
+    let input = component(&doc, &body["properties"]["input"]);
     assert!(
-        doc["components"]["schemas"][target].is_object(),
-        "{reference}"
+        input.get("$defs").is_none(),
+        "definitions moved to components"
     );
-    assert!(body["properties"]["input"].get("$defs").is_none());
+    let point = component(&doc, &input["properties"]["point"]);
+    assert_eq!(point["properties"]["x"]["type"], "integer");
     assert_eq!(doc["components"]["securitySchemes"]["credentials"], scheme);
     let start = &doc["paths"]["/v1/capabilities/shape/1/start"]["post"]["responses"];
     assert!(start["202"].is_object(), "a started operation answers 202");
@@ -866,4 +872,46 @@ fn the_document_keeps_schema_references_resolvable_and_advertises_the_boundary_s
             .any(|p| p["name"] == "cursor")
     );
     assert!(doc["components"]["schemas"]["ErrorResponse"].is_object());
+}
+
+#[test]
+fn components_do_not_collide_when_names_differ_only_in_punctuation() {
+    use herald::{Support, service::Descriptor};
+    let shaped = |name: &str, property: &str| Descriptor {
+        id: id(name),
+        kind: Kind::Query,
+        input_schema: json!({
+            "type": "object",
+            "properties": {"p": {"$ref": "#/$defs/Shared"}, "self": {"$ref": "#"}},
+            "$defs": {"Shared": {"type": "object", "properties": {property: {"type": "integer"}}}}
+        }),
+        output_schema: json!({"type": "object"}),
+        error_schema: json!({"type": "object"}),
+        confirmation_required: false,
+        support: Support::Supported,
+    };
+    let doc = herald_http::document(
+        &[
+            shaped("a.b", "first"),
+            shaped("a-b", "second"),
+            shaped("a_b", "third"),
+        ],
+        &json!({"type": "http", "scheme": "bearer"}),
+    );
+    let schemas = &doc["components"]["schemas"];
+    for (name, property) in [("a.b", "first"), ("a-b", "second"), ("a_b", "third")] {
+        let body = &doc["paths"][format!("/v1/capabilities/{name}/1/call")]["post"]["requestBody"]
+            ["content"]["application/json"]["schema"]["properties"]["input"];
+        let input = schemas[body["$ref"].as_str().unwrap().rsplit('/').next().unwrap()].clone();
+        let shared = input["properties"]["p"]["$ref"].as_str().unwrap();
+        let target = &schemas[shared.rsplit('/').next().unwrap()];
+        assert!(
+            target["properties"][property].is_object(),
+            "{name} resolves to its own definition"
+        );
+        assert_eq!(
+            input["properties"]["self"]["$ref"], body["$ref"],
+            "a pointer to the schema's own root points at its component"
+        );
+    }
 }

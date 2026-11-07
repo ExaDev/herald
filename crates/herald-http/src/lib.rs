@@ -32,6 +32,7 @@ use herald::{
     CapabilityId, Kind,
     exposure::Surface,
     runtime::OperationId,
+    schema_refs::rewrite_refs,
     service::{
         Descriptor, Executed, MAX_KEY_BYTES, MAX_REQUEST_BYTES, Mode, Service, Shape, StartResult,
     },
