@@ -76,6 +76,8 @@ pub enum Outcome {
 pub enum DispatchError {
     DuplicateCapability,
     InvalidSchema(String),
+    /// A capability name that adapters could not address safely.
+    InvalidName(String),
     NotFound,
     Denied,
     Unsupported,
@@ -229,6 +231,34 @@ pub trait Observer: Send + Sync {
     fn subscription_opened(&self, request: &Request, at: u64, result: &Result<(), DispatchError>);
 }
 
+/// The prefix adapters use for their own follow-up tools, so no capability may take it.
+pub const RESERVED_PREFIX: &str = "herald.";
+
+/// A name is addressable on every surface: ASCII letters, digits, `_`, `-` and `.`, not reserved, and
+/// not ending in `.v<digits>`, which adapters read as a version suffix.
+fn validate_name(name: &str) -> Result<(), DispatchError> {
+    let bad = |reason: &str| Err(DispatchError::InvalidName(format!("{name:?}: {reason}")));
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return bad("only ASCII letters, digits, '_', '-' and '.' are allowed");
+    }
+    if name.starts_with(RESERVED_PREFIX) {
+        return bad("the 'herald.' prefix is reserved");
+    }
+    if let Some((_, suffix)) = name.rsplit_once(".v")
+        && !suffix.is_empty()
+        && suffix.bytes().all(|b| b.is_ascii_digit())
+    {
+        return bad("a trailing '.v<digits>' reads as a version");
+    }
+    Ok(())
+}
+
 struct InFlight<'a> {
     observer: &'a dyn Observer,
     clock: &'a dyn Clock,
@@ -342,6 +372,7 @@ impl Dispatcher {
         handler: Option<Arc<dyn Handler>>,
         subscription: Option<Arc<dyn SubscriptionHandler>>,
     ) -> Result<(), DispatchError> {
+        validate_name(&contract.id.name)?;
         if self.entries.contains_key(&contract.id) {
             return Err(DispatchError::DuplicateCapability);
         }

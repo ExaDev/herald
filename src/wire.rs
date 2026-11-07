@@ -35,6 +35,10 @@ pub enum ErrorCode {
     Store,
     /// The request itself was malformed (a missing key, a bad cursor).
     BadRequest,
+    /// The request body was larger than the adapter accepts.
+    TooLarge,
+    /// The request was not in a media type the adapter accepts.
+    UnsupportedMedia,
     /// The same key is still running. Follow the operation by id instead of submitting again.
     InProgress,
     /// A product's source for a subscription failed; `detail` is its error object.
@@ -104,6 +108,7 @@ impl From<&DispatchError> for WireError {
             | D::InvalidError(_)
             | D::InvalidEvent(_)
             | D::InvalidSchema(_)
+            | D::InvalidName(_)
             | D::DuplicateCapability => (
                 ErrorCode::ContractViolation,
                 "the handler's response broke its contract",
