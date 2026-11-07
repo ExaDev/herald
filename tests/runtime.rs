@@ -1,7 +1,7 @@
 use herald::runtime::{
     MemoryOperationStore, OperationEvent, OperationId, OperationRecord, OperationState,
-    OperationStore, Reservation, Runtime, StoreError, Submission, SubmitEnvelope, Transport,
-    TransportError,
+    OperationStore, Reservation, RunningLimit, Runtime, Started, StoreError, Submission,
+    SubmitEnvelope, Transport, TransportError,
 };
 use herald::{
     Authorizer, Cancellation, CapabilityId, Clock, Confirmer, Contract, DispatchError, Dispatcher,
@@ -12,6 +12,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 struct Ports {
     allow: AtomicBool,
@@ -33,7 +34,7 @@ impl Authorizer for Ports {
     fn authorize<'a>(&'a self, request: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
         Box::pin(async move {
             if self.panic_next.swap(false, Ordering::SeqCst) {
-                panic!("authorizer failure");
+                panic!("authoriser failure");
             }
             if self.deny_x.load(Ordering::SeqCst) && request.input["resource"] == "x" {
                 return false;
@@ -760,12 +761,13 @@ async fn a_failure_before_admission_does_not_interrupt_another_live_attempt() {
     while calls.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
-    // A second delivery of the same key panics in the product's authorizer before it reserves anything.
+    // A second delivery of the same key panics in the product's authoriser before it reserves anything.
     ports.panic_next.store(true, Ordering::SeqCst);
     let second = runtime
         .submit(request("a", json!({})), "k".into(), live())
         .await;
-    assert_eq!(second.result, Err(DispatchError::OutcomeLost));
+    // Nothing was reserved, so the handler cannot have run and nothing is unknown.
+    assert_eq!(second.result, Err(DispatchError::InterruptedBeforeDispatch));
     release.notify_one();
     let first = first.await.unwrap();
     assert!(matches!(first.result, Ok(Outcome::Success(_))));
@@ -954,4 +956,499 @@ async fn shutdown_stops_a_handler_that_never_completes_and_frees_the_store() {
         other => panic!("expected the runtime's unknown outcome, got {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+async fn limited(
+    d: &Arc<Dispatcher>,
+    store: &Arc<MemoryOperationStore>,
+    global: usize,
+    per_caller: usize,
+) -> Runtime {
+    Runtime::open_limited(
+        d.clone(),
+        store.clone(),
+        RunningLimit::new(global, per_caller, Duration::from_secs(600)).unwrap(),
+    )
+    .await
+    .unwrap()
+    .0
+}
+
+#[test]
+fn a_running_limit_that_admits_nobody_gives_one_caller_more_than_the_whole_or_allows_no_time_cannot_be_built()
+ {
+    let long = Duration::from_secs(1);
+    assert!(RunningLimit::new(4, 0, long).is_err());
+    assert!(RunningLimit::new(2, 3, long).is_err());
+    assert!(RunningLimit::new(2, 2, Duration::ZERO).is_err());
+    assert!(RunningLimit::new(2, 2, long).is_ok());
+}
+
+#[tokio::test]
+async fn detached_operations_are_bounded_per_caller_and_overall_and_a_retry_of_a_running_one_is_free()
+ {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let runtime = limited(&dispatcher(&ports, &calls, true), &store, 3, 2).await;
+    let start = |who: &'static str, key: &'static str| {
+        runtime.start(request(who, json!({})), key.into(), live())
+    };
+    assert!(matches!(start("a", "1").await, Started::Running(_)));
+    let again = start("a", "1").await;
+    assert!(
+        matches!(again, Started::Running(_)),
+        "a retry of a running key takes no slot: {again:?}"
+    );
+    assert!(matches!(start("a", "2").await, Started::Running(_)));
+    // The caller holds its two; a third is turned away before anything is stored or run.
+    let Started::Finished(refused) = start("a", "3").await else {
+        panic!("a third operation for one caller is refused")
+    };
+    assert_eq!(refused.result, Err(DispatchError::Unavailable));
+    // Another caller still has the global slot left, and then the runtime is full.
+    assert!(matches!(start("b", "1").await, Started::Running(_)));
+    let Started::Finished(full) = start("c", "1").await else {
+        panic!("the runtime is full")
+    };
+    assert_eq!(full.result, Err(DispatchError::Unavailable));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "refused requests ran nothing"
+    );
+    assert!(
+        runtime.get("a", &refused.id).await.unwrap().is_none(),
+        "a refused request leaves no record"
+    );
+    // Shutting down stops the stalled handlers and frees the slots with them.
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_finished_operation_frees_its_slot() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let runtime = limited(&dispatcher(&ports, &calls, false), &store, 1, 1).await;
+    for key in ["1", "2", "3"] {
+        let done = runtime
+            .submit(request("a", json!({})), key.into(), live())
+            .await;
+        assert!(done.result.is_ok(), "{key}: {:?}", done.result);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn a_handler_still_running_at_the_ceiling_is_stopped_and_recorded_as_interrupted() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let (runtime, _) = Runtime::open_limited(
+        dispatcher(&ports, &calls, true),
+        store.clone(),
+        RunningLimit::new(1, 1, Duration::from_millis(100)).unwrap(),
+    )
+    .await
+    .unwrap();
+    // The handler never returns. At the ceiling it is stopped and the caller is told it is lost.
+    let lost = runtime
+        .submit(request("a", json!({})), "k".into(), live())
+        .await;
+    assert_eq!(lost.result, Err(DispatchError::OutcomeLost));
+    let view = runtime.get("a", &lost.id).await.unwrap().unwrap();
+    assert_eq!(view.state(), &OperationState::Interrupted);
+    // Its slot came back, and the key reads as interrupted instead of running again.
+    let retry = runtime
+        .submit(request("a", json!({})), "k".into(), live())
+        .await;
+    match retry.result {
+        Ok(Outcome::Unknown(v)) => assert_eq!(v["state"], "interrupted"),
+        other => panic!("expected the runtime's unknown outcome, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler ran once");
+    let other = runtime
+        .submit(request("a", json!({})), "k2".into(), live())
+        .await;
+    assert_eq!(
+        other.result,
+        Err(DispatchError::OutcomeLost),
+        "the slot was free"
+    );
+}
+
+#[tokio::test]
+async fn a_confirmation_claimed_in_an_envelope_is_not_taken_from_the_wire() {
+    struct Echo(Arc<AtomicBool>);
+    impl Confirmer for Echo {
+        fn confirm<'a>(&'a self, request: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
+            let claimed = request.confirmed;
+            self.0.store(claimed, Ordering::SeqCst);
+            Box::pin(async move { claimed })
+        }
+    }
+    let ports = Ports::allowing();
+    let saw_claim = Arc::new(AtomicBool::new(false));
+    let mut d = Dispatcher::new(
+        ports.clone(),
+        Arc::new(Echo(saw_claim.clone())),
+        ports.clone(),
+        ports.clone(),
+    );
+    d.register(
+        Contract {
+            id: id(),
+            kind: Kind::Operation,
+            input_schema: json!({"type":"object"}),
+            output_schema: json!({"type":"object"}),
+            error_schema: json!({"type":"object"}),
+            event_schema: json!(true),
+            required_capabilities: vec![],
+            confirmation_required: true,
+            support: Support::Supported,
+        },
+        Arc::new(Mutation {
+            calls: Arc::new(AtomicUsize::new(0)),
+            stall: false,
+        }),
+    )
+    .unwrap();
+    let store = Arc::new(MemoryOperationStore::default());
+    let runtime = open(&Arc::new(d), &store).await;
+    let mut claimed = request("a", json!({}));
+    claimed.confirmed = true;
+    let result = runtime
+        .handle(
+            "a",
+            SubmitEnvelope {
+                request: claimed,
+                key: "k".into(),
+            },
+            live(),
+        )
+        .await;
+    assert_eq!(result.result, Err(DispatchError::ConfirmationRequired));
+    assert!(
+        !saw_claim.load(Ordering::SeqCst),
+        "the confirmer saw no claim"
+    );
+}
+
+/// A store whose reads give other tasks a turn before answering, so a read and the check made before it are not one step. With a gate, the first read waits for the test to open it, which makes the interleaving exact instead of a matter of how many turns it takes.
+struct SlowReads {
+    inner: MemoryOperationStore,
+    gate: Option<Arc<tokio::sync::Notify>>,
+    gated: AtomicBool,
+}
+
+impl SlowReads {
+    fn new(gate: Option<Arc<tokio::sync::Notify>>) -> Self {
+        Self {
+            inner: MemoryOperationStore::default(),
+            gated: AtomicBool::new(gate.is_some()),
+            gate,
+        }
+    }
+}
+
+impl OperationStore for SlowReads {
+    fn reserve<'a>(
+        &'a self,
+        r: OperationRecord,
+    ) -> PortFuture<'a, Result<Reservation, StoreError>> {
+        self.inner.reserve(r)
+    }
+    fn complete<'a>(
+        &'a self,
+        id: &'a OperationId,
+        o: Outcome,
+    ) -> PortFuture<'a, Result<(), StoreError>> {
+        self.inner.complete(id, o)
+    }
+    fn get<'a>(
+        &'a self,
+        id: &'a OperationId,
+    ) -> PortFuture<'a, Result<Option<OperationRecord>, StoreError>> {
+        Box::pin(async move {
+            if self.gated.swap(false, Ordering::SeqCst) {
+                if let Some(gate) = &self.gate {
+                    gate.notified().await;
+                }
+            } else {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            self.inner.get(id).await
+        })
+    }
+    fn recover<'a>(&'a self) -> PortFuture<'a, Result<Vec<OperationId>, StoreError>> {
+        self.inner.recover()
+    }
+    fn abandon<'a>(&'a self, id: &'a OperationId) -> PortFuture<'a, Result<(), StoreError>> {
+        self.inner.abandon(id)
+    }
+    fn acquire<'a>(&'a self) -> PortFuture<'a, Result<(), StoreError>> {
+        self.inner.acquire()
+    }
+    fn release(&self) {
+        self.inner.release()
+    }
+}
+
+#[tokio::test]
+async fn a_read_that_races_the_first_attempt_never_shows_a_running_operation_as_interrupted() {
+    let (ports, calls) = (Ports::allowing(), Arc::new(AtomicUsize::new(0)));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let store: Arc<dyn OperationStore> = Arc::new(SlowReads::new(Some(gate.clone())));
+    let runtime = Arc::new(
+        Runtime::open(dispatcher(&ports, &calls, true), store)
+            .await
+            .unwrap()
+            .0,
+    );
+    // The id a client can compute for itself before it has been told it.
+    let id = herald_id("a", "race");
+    // The read finds nothing running and goes to the store, which holds it there until the test opens the gate. By then the attempt has started and reserved the record.
+    let reader = {
+        let runtime = runtime.clone();
+        let id = id.clone();
+        tokio::spawn(async move { runtime.get("a", &id).await.unwrap() })
+    };
+    // Let the reader reach the store before the attempt starts.
+    tokio::task::yield_now().await;
+    let started = runtime
+        .start(request("a", json!({})), "race".into(), live())
+        .await;
+    assert!(matches!(started, Started::Running(_)));
+    gate.notify_one();
+    let view = reader
+        .await
+        .unwrap()
+        .expect("the record exists once the read finishes");
+    assert_eq!(
+        view.state(),
+        &OperationState::Accepted,
+        "a running operation is never shown as interrupted: {view:?}"
+    );
+    Arc::try_unwrap(runtime)
+        .ok()
+        .expect("the reader has finished")
+        .shutdown()
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_detached_operation_past_the_ceiling_is_interrupted_and_frees_its_slot() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let (runtime, _) = Runtime::open_limited(
+        dispatcher(&ports, &calls, true),
+        store.clone(),
+        RunningLimit::new(1, 1, Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let started = runtime
+        .start(request("a", json!({})), "long".into(), live())
+        .await;
+    let Started::Running(id) = started else {
+        panic!("the handler is running")
+    };
+    // A retry while it runs is told so, and takes no slot.
+    let again = runtime
+        .start(request("a", json!({})), "long".into(), live())
+        .await;
+    assert!(matches!(again, Started::Running(_)));
+    // The runtime is full for anyone else.
+    let Started::Finished(full) = runtime
+        .start(request("a", json!({})), "other".into(), live())
+        .await
+    else {
+        panic!("the limit is reached")
+    };
+    assert_eq!(full.result, Err(DispatchError::Unavailable));
+    assert_eq!(
+        runtime.get("a", &id).await.unwrap().unwrap().state(),
+        &OperationState::Accepted
+    );
+    // Time passes beyond the ceiling.
+    tokio::time::advance(Duration::from_secs(61)).await;
+    // The ceiling stops the handler and records the interruption on the supervising task, which gets its turn as the reads below yield.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while runtime.get("a", &id).await.unwrap().unwrap().state() != &OperationState::Interrupted
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the operation was recorded as interrupted");
+    // The slot is free again, and a retry of the stopped key replays the unknown outcome.
+    let retry = runtime
+        .submit(request("a", json!({})), "long".into(), live())
+        .await;
+    match retry.result {
+        Ok(Outcome::Unknown(v)) => assert_eq!(v["state"], "interrupted"),
+        other => panic!("expected the runtime's unknown outcome, got {other:?}"),
+    }
+    let next = runtime
+        .start(request("a", json!({})), "next".into(), live())
+        .await;
+    assert!(
+        matches!(next, Started::Running(_)),
+        "the slot came back: {next:?}"
+    );
+    runtime.shutdown().await;
+}
+
+/// An authoriser that never answers, standing in for a policy waiting on a person.
+struct Waits;
+impl Authorizer for Waits {
+    fn authorize<'a>(&'a self, _: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ceiling_reached_before_the_record_is_reserved_reports_that_nothing_ran() {
+    let ports = Ports::allowing();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut d = Dispatcher::new(Arc::new(Waits), ports.clone(), ports.clone(), ports);
+    d.register(
+        Contract {
+            id: id(),
+            kind: Kind::Operation,
+            input_schema: json!({"type":"object"}),
+            output_schema: json!({"type":"object"}),
+            error_schema: json!({"type":"object"}),
+            event_schema: json!(true),
+            required_capabilities: vec![],
+            confirmation_required: false,
+            support: Support::Supported,
+        },
+        Arc::new(Mutation {
+            calls: calls.clone(),
+            stall: false,
+        }),
+    )
+    .unwrap();
+    let store = Arc::new(MemoryOperationStore::default());
+    let (runtime, _) = Runtime::open_limited(
+        Arc::new(d),
+        store.clone(),
+        RunningLimit::new(1, 1, Duration::from_secs(60)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let submitted = tokio::spawn({
+        let runtime = Arc::new(runtime);
+        async move {
+            runtime
+                .submit(request("a", json!({})), "k".into(), live())
+                .await
+        }
+    });
+    // The submission waits on the authoriser for ever; once the paused clock passes the ceiling the runtime stops it.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let submission = submitted.await.unwrap();
+    assert_eq!(
+        submission.result,
+        Err(DispatchError::InterruptedBeforeDispatch)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never ran");
+    assert!(
+        store.get(&submission.id).await.unwrap().is_none(),
+        "nothing was reserved, so there is no record to mark"
+    );
+}
+
+#[tokio::test]
+async fn a_read_is_not_held_up_by_a_steady_stream_of_starts_elsewhere() {
+    let (ports, calls) = (Ports::allowing(), Arc::new(AtomicUsize::new(0)));
+    let store: Arc<dyn OperationStore> = Arc::new(SlowReads::new(None));
+    let runtime = Arc::new(
+        Runtime::open(dispatcher(&ports, &calls, false), store)
+            .await
+            .unwrap()
+            .0,
+    );
+    let kept = runtime
+        .submit(request("a", json!({})), "kept".into(), live())
+        .await;
+    let reading = Arc::new(AtomicBool::new(true));
+    // Many submitters keep starting attempts on other operations for as long as the read is running.
+    let churn: Vec<_> = (0..16)
+        .map(|worker| {
+            let (runtime, reading) = (runtime.clone(), reading.clone());
+            tokio::spawn(async move {
+                let mut n = 0;
+                while reading.load(Ordering::SeqCst) {
+                    runtime
+                        .submit(
+                            request("b", json!({})),
+                            format!("other-{worker}-{n}"),
+                            live(),
+                        )
+                        .await;
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+    for _ in 0..20 {
+        let view = tokio::time::timeout(Duration::from_secs(30), runtime.get("a", &kept.id))
+            .await
+            .expect("a read finishes while starts continue elsewhere")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(view.state(), OperationState::Completed(_)));
+    }
+    reading.store(false, Ordering::SeqCst);
+    for worker in churn {
+        worker.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn two_spellings_of_the_same_number_are_one_payload_and_an_integer_and_a_float_are_two() {
+    let (ports, calls, store) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(MemoryOperationStore::default()),
+    );
+    let runtime = open(&dispatcher(&ports, &calls, false), &store).await;
+    let submit = |input: serde_json::Value| {
+        let runtime = &runtime;
+        async move {
+            runtime
+                .submit(request("a", input), "k".into(), live())
+                .await
+        }
+    };
+    let first = submit(serde_json::from_str(r#"{"n": 1e5}"#).unwrap()).await;
+    assert!(first.result.is_ok());
+    // The same number written another way is the same payload: the key replays, and nothing reruns.
+    let again = submit(serde_json::from_str(r#"{"n": 100000.0}"#).unwrap()).await;
+    assert!(again.result.is_ok(), "{again:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // An integer and a float are different payloads, so the key is a conflict.
+    let integer = runtime
+        .submit(request("a", json!({"n": 1})), "other".into(), live())
+        .await;
+    assert!(integer.result.is_ok());
+    let float = runtime
+        .submit(request("a", json!({"n": 1.0})), "other".into(), live())
+        .await;
+    assert_eq!(float.result, Err(DispatchError::KeyConflict));
 }
