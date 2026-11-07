@@ -448,7 +448,6 @@ pub fn routes(service: Arc<Service>, boundary: &Boundary) -> axum::Router {
     );
     axum::Router::new()
         .route_service(MCP_PATH, mcp)
-        .fallback(|| async { error_response(WireError::new(ErrorCode::NotFound, "no such route")) })
         .layer(axum::middleware::from_fn(typed_errors))
 }
 

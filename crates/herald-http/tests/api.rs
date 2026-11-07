@@ -618,7 +618,8 @@ async fn the_openapi_document_is_generated_for_the_caller_from_the_contracts() {
             .as_object()
             .unwrap()
             .keys()
-            .all(|p| p.starts_with("/v1/operations"))
+            .all(|p| !p.starts_with("/v1/capabilities/")),
+        "no capability path for a caller who may use none"
     );
 }
 
@@ -1218,8 +1219,11 @@ async fn both_adapters_served_from_one_guarded_router_share_one_boundary() {
     let address = listener.local_addr().unwrap();
     let policy = OriginPolicy::new([address.to_string()], [ORIGIN.to_string()]).unwrap();
     let boundary = Boundary::new(Arc::new(Tokens), policy, limits());
-    let app = herald_http::router(w.service.clone(), boundary.clone())
-        .merge(herald_mcp::router(w.service.clone(), boundary));
+    let app = herald_boundary::Guarded::new(
+        herald_http::routes(w.service.clone(), &boundary),
+        boundary.clone(),
+    )
+    .merge(herald_mcp::routes(w.service.clone(), &boundary));
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
             .await

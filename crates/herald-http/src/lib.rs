@@ -122,8 +122,9 @@ impl<F: FnMut()> Drop for OnDrop<F> {
     }
 }
 
-/// The API's routes with no boundary applied. Compose with other routes and pass the result to
-/// [`Guarded::new`]; every handler refuses a request that did not come through the boundary.
+/// The API's routes with no boundary applied and no fallback of their own outside `/v1`. Compose
+/// them with other routes in [`Guarded`], which adds the boundary and the typed answers for what
+/// matches nothing; every handler refuses a request that did not come through the boundary.
 pub fn routes(service: Arc<Service>, boundary: &Boundary) -> Router {
     let security = boundary.security_scheme();
     let api = Router::new()
@@ -138,10 +139,7 @@ pub fn routes(service: Arc<Service>, boundary: &Boundary) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(Extension(Scheme(security)))
         .with_state(service);
-    Router::new()
-        .nest(API_PREFIX, api)
-        .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed)
+    Router::new().nest(API_PREFIX, api)
 }
 
 /// The API under `/v1`, behind the boundary.
@@ -206,25 +204,38 @@ async fn run(
         Ok(prepared) => prepared,
         Err(error) => return error_response(error),
     };
-    // A call ends when the client goes away. A start outlives its request, so nothing cancels it.
+    // A call ends when the client goes away: the handler is told to stop, and, since the connection's
+    // task is dropped at that point, the work runs on a task of its own so the handler can see the
+    // signal and wind down instead of being dropped mid-await.
     let (sender, cancellation) = herald::cancellation();
     let _cancel_on_drop = (mode == Mode::Call).then(|| {
         OnDrop(move || {
             let _ = sender.send(true);
         })
     });
-    match service
-        .execute(&principal, &capability, prepared, mode, cancellation)
-        .await
-    {
-        Ok(executed) => {
+    let work = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .execute(&principal, &capability, prepared, mode, cancellation)
+                .await
+        }
+    });
+    match work.await {
+        Ok(Ok(executed)) => {
             let status = match &executed {
                 Executed::Start(StartResult::Running { .. }) => StatusCode::ACCEPTED,
                 _ => StatusCode::OK,
             };
             (status, Json(executed.body())).into_response()
         }
-        Err(error) => error_response(error),
+        Ok(Err(error)) => error_response(error),
+        // The handler panicked. It may have run, so its outcome is unknown, as when a runtime
+        // handler panics.
+        Err(_) => error_response(WireError::new(
+            ErrorCode::OutcomeLost,
+            "the outcome is unknown",
+        )),
     }
 }
 

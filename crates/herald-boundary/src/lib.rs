@@ -336,34 +336,54 @@ impl Boundary {
     }
 }
 
-/// A router whose every route is behind the boundary, including routes it will never match. It has
-/// no method that adds a route, so nothing can be placed outside the guard afterwards. To serve
-/// product routes beside Herald's, build one router from the adapters' unguarded `routes` functions
-/// and the product's own, then guard that.
-pub struct Guarded(Router);
+/// Routes that will be served behind the boundary, including the paths and methods they do not
+/// match. The guard and the typed not-found and method-not-allowed answers are applied once, when the
+/// router is finished, so routes from several adapters (each built without a fallback of its own)
+/// compose with [`Guarded::merge`] and nothing can be added outside the guard afterwards.
+pub struct Guarded {
+    routes: Router,
+    boundary: Arc<Boundary>,
+}
 
 impl Guarded {
-    /// Puts `routes` behind `boundary`: its routes, its fallback and its method-not-allowed answers.
+    /// Routes to serve behind `boundary`. Pass a router that has not set its own fallback, such as
+    /// the adapters' `routes` functions return.
     pub fn new(routes: Router, boundary: Arc<Boundary>) -> Self {
-        Self(routes.layer(from_fn_with_state(boundary, Boundary::guard)))
+        Self { routes, boundary }
     }
 
-    /// Combines two guarded routers. Each part keeps its own boundary.
-    pub fn merge(self, other: Guarded) -> Guarded {
-        Guarded(self.0.merge(other.0))
+    /// Adds more routes, for example another adapter's, behind the same boundary.
+    pub fn merge(mut self, routes: Router) -> Self {
+        self.routes = self.routes.merge(routes);
+        self
+    }
+
+    /// The finished router: typed answers for what no route matches, and the guard around all of it.
+    fn finish(self) -> Router {
+        self.routes
+            .fallback(|| async {
+                error_response(WireError::new(ErrorCode::NotFound, "no such route"))
+            })
+            .method_not_allowed_fallback(|| async {
+                let mut response =
+                    error_response(WireError::new(ErrorCode::BadRequest, "method not allowed"));
+                *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                response
+            })
+            .layer(from_fn_with_state(self.boundary, Boundary::guard))
     }
 
     /// For `axum::serve`.
     pub fn into_make_service(self) -> IntoMakeService<Router> {
-        self.0.into_make_service()
+        self.finish().into_make_service()
     }
 
-    /// For tests that drive the router without a socket. The result is a guarded router; adding to it
-    /// is the caller's responsibility and is not covered by the boundary. Only built with the
-    /// `testing` feature, so production code cannot take the guard apart.
+    /// For tests that drive the router without a socket. The result is the finished, guarded router;
+    /// adding to it is the caller's responsibility and is not covered by the boundary. Only built
+    /// with the `testing` feature, so production code cannot take the guard apart.
     #[cfg(feature = "testing")]
     pub fn into_router_for_tests(self) -> Router {
-        self.0
+        self.finish()
     }
 }
 
