@@ -6,6 +6,11 @@
 //! after a restart, never as a failure and never as safe to retry. Storage is a product-supplied
 //! port, so the same runtime sits on memory, a file or a database without the dispatcher knowing.
 //!
+//! An `Unknown` outcome the runtime reports itself (an operation still accepted, interrupted, or a
+//! handler response that broke its contract) has a fixed shape and is not checked against the
+//! capability's error schema, which describes what handlers return. The runtime needs `tokio`: each
+//! handler runs on a spawned task.
+//!
 //! These semantics apply to operations. Subscriptions, media and inference streams are ephemeral
 //! and are not recorded here.
 
@@ -16,7 +21,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// A stable identifier derived from the caller's scope and idempotency key, so it is the same on every retry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,7 +55,28 @@ pub struct OperationRecord {
     /// Digest of the capability and input, used to reject a key reused for another payload.
     pub digest: String,
     pub capability: CapabilityId,
+    /// The submitted input, kept so a read is authorised against the same resource the submission was.
+    pub input: Value,
     pub events: Vec<OperationEvent>,
+}
+
+/// What a caller may read of its own operation: no key, digest or input.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OperationView {
+    pub id: OperationId,
+    pub capability: CapabilityId,
+    pub events: Vec<OperationEvent>,
+}
+
+impl OperationView {
+    /// The latest state. A view always holds at least the `Accepted` event.
+    pub fn state(&self) -> &OperationState {
+        &self
+            .events
+            .last()
+            .expect("a view starts with an Accepted event")
+            .state
+    }
 }
 
 impl OperationRecord {
@@ -246,8 +275,10 @@ pub struct TransportError(pub String);
 /// serialisable envelopes, so any wire can carry them. An error means the outcome is unknown to the
 /// caller: it must retry with the same key, never with a new one.
 pub trait Transport: Send + Sync {
+    /// `identity` is the caller the transport authenticated. The envelope's own identity is a claim and is overwritten.
     fn submit<'a>(
         &'a self,
+        identity: String,
         envelope: SubmitEnvelope,
     ) -> PortFuture<'a, Result<Submission, TransportError>>;
     /// `identity` is the caller the transport authenticated; a runtime only returns that caller's operations.
@@ -260,9 +291,22 @@ pub trait Transport: Send + Sync {
 }
 
 /// Durable, idempotent execution in front of a [`Dispatcher`].
+///
+/// Needs a `tokio` runtime: each handler runs on a spawned task.
 pub struct Runtime {
     dispatcher: Arc<Dispatcher>,
     store: Arc<dyn OperationStore>,
+    lease: Arc<Lease>,
+}
+
+/// Holds the store claim until the runtime and every task it spawned are gone, so a new runtime
+/// cannot open the store while a handler from the old one is still running against it.
+struct Lease(Arc<dyn OperationStore>);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl Runtime {
@@ -273,8 +317,12 @@ impl Runtime {
         store: Arc<dyn OperationStore>,
     ) -> Result<(Self, Vec<OperationId>), StoreError> {
         store.acquire().await?;
-        let runtime = Self { dispatcher, store };
-        // On failure the runtime drops here and releases the claim.
+        let runtime = Self {
+            dispatcher,
+            lease: Arc::new(Lease(Arc::clone(&store))),
+            store,
+        };
+        // On failure the runtime drops here and its lease releases the claim.
         let interrupted = runtime.store.recover().await?;
         Ok((runtime, interrupted))
     }
@@ -300,6 +348,7 @@ impl Runtime {
             key,
             digest: digest(&request),
             capability: request.capability.clone(),
+            input: request.input.clone(),
             events: vec![OperationEvent {
                 seq: 0,
                 state: OperationState::Accepted,
@@ -307,10 +356,15 @@ impl Runtime {
         };
         let dispatcher = Arc::clone(&self.dispatcher);
         let store = Arc::clone(&self.store);
+        let lease = Arc::clone(&self.lease);
+        let reserved = Arc::new(AtomicBool::new(false));
+        let task_reserved = Arc::clone(&reserved);
         let task = tokio::spawn(async move {
+            let _lease = lease;
             let gate = RuntimeGate {
                 store: store.as_ref(),
                 record,
+                reserved: task_reserved,
                 record_error: Mutex::new(None),
             };
             let result = dispatcher.dispatch_with(request, cancellation, &gate).await;
@@ -327,8 +381,13 @@ impl Runtime {
                 record_error,
             },
             Err(_) => {
-                // The handler panicked after it may have run, so the outcome is unknown.
-                let record_error = self.store.abandon(&id).await.err();
+                // The task panicked or was cancelled at shutdown. Only an attempt that reserved the
+                // record may mark it, or a failure before admission would interrupt another live attempt.
+                let record_error = if reserved.load(Ordering::SeqCst) {
+                    self.store.abandon(&id).await.err()
+                } else {
+                    None
+                };
                 Submission {
                     id,
                     result: Err(DispatchError::OutcomeLost),
@@ -338,10 +397,18 @@ impl Runtime {
         }
     }
 
-    /// Serves a [`SubmitEnvelope`] received over a [`Transport`].
-    pub async fn handle(&self, envelope: SubmitEnvelope, cancellation: Cancellation) -> Submission {
-        self.submit(envelope.request, envelope.key, cancellation)
-            .await
+    /// Serves a [`SubmitEnvelope`] received over a [`Transport`] from the authenticated `identity`.
+    /// The identity inside the envelope is a caller claim and is replaced, so a remote client cannot
+    /// submit as, or collide with, another caller.
+    pub async fn handle(
+        &self,
+        identity: &str,
+        envelope: SubmitEnvelope,
+        cancellation: Cancellation,
+    ) -> Submission {
+        let mut request = envelope.request;
+        request.identity = identity.to_owned();
+        self.submit(request, envelope.key, cancellation).await
     }
 
     /// The operation, only if `identity` created it and the product's authorizer still admits that
@@ -351,7 +418,7 @@ impl Runtime {
         &self,
         identity: &str,
         id: &OperationId,
-    ) -> Result<Option<OperationRecord>, StoreError> {
+    ) -> Result<Option<OperationView>, StoreError> {
         let Some(record) = self.store.get(id).await? else {
             return Ok(None);
         };
@@ -361,10 +428,18 @@ impl Runtime {
         let probe = Request {
             capability: record.capability.clone(),
             identity: identity.to_owned(),
-            input: Value::Null,
+            input: record.input.clone(),
             confirmed: false,
         };
-        Ok(self.dispatcher.authorise(&probe).await.then_some(record))
+        Ok(self
+            .dispatcher
+            .authorise(&probe)
+            .await
+            .then_some(OperationView {
+                id: record.id,
+                capability: record.capability,
+                events: record.events,
+            }))
     }
 
     /// Events from `cursor` onward, where the cursor is the number of events the client has already seen.
@@ -387,15 +462,11 @@ impl Runtime {
     }
 }
 
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        self.store.release();
-    }
-}
-
 struct RuntimeGate<'a> {
     store: &'a dyn OperationStore,
     record: OperationRecord,
+    /// Set once this attempt holds the reservation, shared with the submitting future.
+    reserved: Arc<AtomicBool>,
     record_error: Mutex<Option<StoreError>>,
 }
 
@@ -403,7 +474,10 @@ impl Gate for RuntimeGate<'_> {
     fn admit<'a>(&'a self, _: &'a Request) -> PortFuture<'a, Admission> {
         Box::pin(async move {
             match self.store.reserve(self.record.clone()).await {
-                Ok(Reservation::New) => Admission::Proceed,
+                Ok(Reservation::New) => {
+                    self.reserved.store(true, Ordering::SeqCst);
+                    Admission::Proceed
+                }
                 Ok(Reservation::Conflict) => Admission::Reject(DispatchError::KeyConflict),
                 Ok(Reservation::Existing(existing)) => match existing.state() {
                     OperationState::Completed(outcome) => Admission::Replay(outcome.clone()),
