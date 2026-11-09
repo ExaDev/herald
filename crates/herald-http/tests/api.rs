@@ -716,40 +716,6 @@ async fn the_openapi_document_is_generated_for_the_caller_from_the_contracts() {
     );
 }
 
-/// POSTs a body whose declared length is over the request limit and sends none of it, then reads the whole reply. The limit is judged from the declared length, so the reply does not depend on the body being sent: a client that streams megabytes at a server that answers and closes can lose the reply to a connection reset, which is what an oversized body sent through an HTTP client did intermittently.
-async fn declared_oversized_post(base: &str, path: &str, token: &str) -> (u16, String) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let rest = base
-        .strip_prefix("http://")
-        .expect("the world serves plain HTTP");
-    let (authority, prefix) = match rest.split_once('/') {
-        Some((authority, prefix)) => (authority, format!("/{prefix}")),
-        None => (rest, String::new()),
-    };
-    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
-    let head = format!(
-        "POST {prefix}{path} HTTP/1.1\r\nhost: {authority}\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        herald::service::MAX_REQUEST_BYTES + 1
-    );
-    stream.write_all(head.as_bytes()).await.unwrap();
-    let mut reply = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut reply))
-        .await
-        .expect("the server answers an oversized declared length without waiting for the body")
-        .unwrap();
-    let reply = String::from_utf8(reply).unwrap();
-    let (head, body) = reply
-        .split_once("\r\n\r\n")
-        .expect("a complete response head");
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .expect("a status line")
-        .parse()
-        .unwrap();
-    (status, body.to_owned())
-}
-
 #[tokio::test]
 async fn error_and_unknown_outcomes_are_reported_in_a_200_with_their_flags() {
     let w = world().await;
@@ -795,15 +761,22 @@ async fn malformed_requests_get_typed_errors_that_do_not_depend_on_the_capabilit
         assert!(r.text().await.unwrap().contains("unsupported_media"));
     }
     // Too large: a typed 413, the same for an exposed, an unexposed and an unknown capability, and for a caller the product denies.
+    // One byte over the limit and no more: the server stops reading at the first byte past it, so none of the body is left unread when it answers and closes. A larger body leaves bytes in flight, and a server that closes with unread data resets the connection, which cost the client its reply intermittently.
+    let huge = "a".repeat(herald::service::MAX_REQUEST_BYTES + 1);
     let mut replies = Vec::new();
     for (token, path) in [
         ("alice-token", "/capabilities/read/1/call"),
         ("alice-token", "/capabilities/nothing/1/call"),
         ("mallory-token", "/capabilities/read/1/call"),
     ] {
-        let (status, body) = declared_oversized_post(&w.base, path, token).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16(), "{path}");
-        replies.push(body);
+        let r = raw(path, token)
+            .header("content-type", "application/json")
+            .body(huge.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        replies.push(r.text().await.unwrap());
     }
     assert!(
         replies
