@@ -35,10 +35,26 @@ fn limits() -> Limits {
 
 const ORIGIN: &str = "https://app.example.test";
 
-struct Policy;
+/// Holds the authorisation of the `gated` capability until it is released, like a product whose policy store stalls.
+#[derive(Default)]
+struct Gate {
+    entered: AtomicUsize,
+    release: Notify,
+}
+
+#[derive(Default)]
+struct Policy {
+    gate: Arc<Gate>,
+}
 impl Authorizer for Policy {
-    fn authorize<'a>(&'a self, r: &'a Request, _: &'a Contract) -> PortFuture<'a, bool> {
-        Box::pin(async move { ["alice", "bob"].contains(&r.identity.as_str()) })
+    fn authorize<'a>(&'a self, r: &'a Request, c: &'a Contract) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            if c.id.name == "gated" {
+                self.gate.entered.fetch_add(1, Ordering::SeqCst);
+                self.gate.release.notified().await;
+            }
+            ["alice", "bob"].contains(&r.identity.as_str())
+        })
     }
 }
 impl Confirmer for Policy {
@@ -151,6 +167,7 @@ struct World {
     calls: Arc<AtomicUsize>,
     cancelled: Arc<AtomicUsize>,
     release: Arc<Notify>,
+    gate: Arc<Gate>,
     url: String,
     _server: tokio::task::JoinHandle<()>,
 }
@@ -161,12 +178,14 @@ async fn world() -> World {
 
 /// A world whose boundary is bounded as stated, to test the limits themselves.
 async fn world_with(boundary_limits: Limits) -> World {
-    let policy = Arc::new(Policy);
+    let policy = Arc::new(Policy::default());
+    let gate = policy.gate.clone();
     let (calls, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
     let cancelled = Arc::new(AtomicUsize::new(0));
     let mut d = Dispatcher::new(policy.clone(), policy.clone(), policy.clone(), policy);
     for (name, kind, wait, behaviour) in [
         ("read", Kind::Query, false, Behaviour::Succeed),
+        ("gated", Kind::Query, false, Behaviour::Succeed),
         ("write", Kind::Operation, false, Behaviour::Succeed),
         ("slow", Kind::Operation, true, Behaviour::Succeed),
         ("hang", Kind::Query, true, Behaviour::Succeed),
@@ -214,6 +233,7 @@ async fn world_with(boundary_limits: Limits) -> World {
     .unwrap();
     let exposure = [
         "read",
+        "gated",
         "write",
         "slow",
         "hang",
@@ -251,6 +271,7 @@ async fn world_with(boundary_limits: Limits) -> World {
         calls,
         cancelled,
         release,
+        gate,
         url: format!("http://127.0.0.1:{port}/mcp"),
         _server: server,
     }
@@ -1350,8 +1371,46 @@ async fn a_synchronous_mcp_call_holds_the_slot_until_its_handler_returns_even_af
     .expect("the slot came back");
 }
 #[tokio::test]
+async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_deadline() {
+    let world = world_with(Limits::new(Duration::from_secs(3), 1, 1).unwrap()).await;
+    let request = tokio::spawn({
+        let client = reqwest::Client::new();
+        client
+            .post(&world.url)
+            .header("authorization", "Bearer alice-token")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "gated.v1", "arguments": {}}}))
+            .send()
+    });
+    // The handler is waiting in authorisation, before any execution. The request ends at the deadline.
+    wait_until(|| world.gate.entered.load(Ordering::SeqCst) == 1).await;
+    let ended = request.await.unwrap().unwrap();
+    assert_eq!(ended.status().as_u16(), 504);
+    // The request is gone but the handler task is not, so its slot is still taken and the next request is shed. Without the hold from the first await the deadline would have freed the slot while work was still running.
+    let shed = rpc_call(&world, "read.v1", json!({"x": 1})).await;
+    assert_eq!(shed.status().as_u16(), 503);
+    world.gate.release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if rpc_call(&world, "read.v1", json!({"x": 1}))
+                .await
+                .status()
+                .as_u16()
+                == 200
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the slot came back");
+}
+#[tokio::test]
 async fn a_service_over_an_unbounded_runtime_cannot_be_served_over_a_network() {
-    let policy = Arc::new(Policy);
+    let policy = Arc::new(Policy::default());
     let mut d = Dispatcher::new(policy.clone(), policy.clone(), policy.clone(), policy);
     d.register(
         contract("read", Kind::Query),
