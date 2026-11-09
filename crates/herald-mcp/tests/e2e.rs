@@ -1443,10 +1443,10 @@ async fn a_service_over_an_unbounded_runtime_cannot_be_served_over_a_network() {
             Arc::new(
                 Runtime::open(
                     Arc::new(Dispatcher::new(
-                        Arc::new(Policy),
-                        Arc::new(Policy),
-                        Arc::new(Policy),
-                        Arc::new(Policy),
+                        Arc::new(Policy::default()),
+                        Arc::new(Policy::default()),
+                        Arc::new(Policy::default()),
+                        Arc::new(Policy::default()),
                     )),
                     Arc::new(MemoryOperationStore::default()),
                 )
