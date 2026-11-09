@@ -370,6 +370,7 @@ async fn both_transports_expose_the_same_tools_with_the_same_schemas() {
             "confirms.v1",
             "doubts.v1",
             "fails.v1",
+            "gated.v1",
             "hang.v1",
             EVENTS_TOOL,
             OPERATION_TOOL,
