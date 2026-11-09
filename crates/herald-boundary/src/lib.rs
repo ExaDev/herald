@@ -210,6 +210,11 @@ impl Limits {
         if max_per_caller > max_in_flight {
             return Err(LimitsError("one caller cannot exceed the overall limit"));
         }
+        if max_in_flight > Semaphore::MAX_PERMITS {
+            return Err(LimitsError(
+                "the overall limit is more than a semaphore can hold",
+            ));
+        }
         Ok(Self {
             request_timeout,
             max_in_flight,
