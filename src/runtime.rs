@@ -7,8 +7,8 @@
 //! These semantics apply to operations. Subscriptions, media and inference streams are ephemeral and are not recorded here.
 
 use crate::{
-    Admission, Cancellation, CapabilityId, DispatchError, Dispatcher, Gate, Outcome, PortFuture,
-    Request,
+    Admission, Cancellation, CapabilityId, Clock, DispatchError, Dispatcher, Gate, Outcome,
+    PortFuture, Request,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -91,6 +91,47 @@ pub enum Reservation {
     Existing(OperationRecord),
     /// The scope and key were reserved for a different payload.
     Conflict,
+    /// The key is new, but the caller already holds its quota of records and none has outlived its retention. Nothing was stored.
+    Full,
+}
+
+/// The quota and retention a store enforces so that what it keeps at rest stays bounded per caller. [`RunningLimit`] bounds operations that are running; these bound the ones that are stored, each of which keeps its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreBounds {
+    per_caller_records: usize,
+    retention: u64,
+}
+
+/// A bound that would let a caller store no record, or keep a finished record for no time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreBoundsError(pub &'static str);
+
+impl StoreBounds {
+    /// A caller may hold at most `per_caller_records` records. A record that has finished (any state but `Accepted`) may be dropped once more than `retention` has passed since it finished, in the units of the injected [`Clock::now`]. A record still `Accepted` is never dropped.
+    pub fn new(per_caller_records: usize, retention: u64) -> Result<Self, StoreBoundsError> {
+        if per_caller_records == 0 {
+            return Err(StoreBoundsError("a caller must be allowed one record"));
+        }
+        if retention == 0 {
+            return Err(StoreBoundsError(
+                "a finished record must be kept for some time",
+            ));
+        }
+        Ok(Self {
+            per_caller_records,
+            retention,
+        })
+    }
+
+    /// The most records one caller may hold.
+    pub fn per_caller_records(&self) -> usize {
+        self.per_caller_records
+    }
+
+    /// How long a finished record is kept, in the units of the injected [`Clock::now`].
+    pub fn retention(&self) -> u64 {
+        self.retention
+    }
 }
 
 /// A storage failure.
@@ -101,9 +142,11 @@ pub struct StoreError(pub String);
 ///
 /// A store is driven by one runtime at a time, enforced through `acquire`. `recover` treats every `Accepted` operation as abandoned, so a store shared by two live runtimes would mark running work interrupted. A persistent store should back `acquire` with an exclusive lock.
 ///
-/// Every operation's input is kept so a read can be authorised against it, and nothing here ends a record. How long records live and how many one caller may hold are the store's policy: a store behind a network keeps a retention period and a per-caller quota, because the runtime's [`RunningLimit`] bounds operations that are running, not those that are stored.
+/// Every operation's input is kept so a read can be authorised against it. How long records live and how many one caller may hold are the store's policy, declared by [`OperationStore::bounds`]: a store behind a network keeps a retention period and a per-caller quota, because the runtime's [`RunningLimit`] bounds operations that are running, not those that are stored. [`Runtime::open_limited`] refuses a store that declares none.
 pub trait OperationStore: Send + Sync {
-    /// Reserves `(scope, key)` for the record, or reports the existing reservation or a conflict. It must not persist the record when it returns an error, because nothing runs after a failed reservation. It must also be safe to drop at any await: either the record is stored when the future ends or it is not, never half-stored, because a runtime stopped during `reserve` reports that nothing ran.
+    /// The quota and retention this store enforces, or `None` when it enforces neither. A store reachable from a network must return `Some` and must enforce what it declares: `reserve` returns [`Reservation::Full`] for a new key from a caller already at its quota.
+    fn bounds(&self) -> Option<StoreBounds>;
+    /// Reserves `(scope, key)` for the record, or reports the existing reservation, a conflict or that the caller's quota is full. It must not persist the record when it returns an error, because nothing runs after a failed reservation. It must also be safe to drop at any await: either the record is stored when the future ends or it is not, never half-stored, because a runtime stopped during `reserve` reports that nothing ran.
     fn reserve<'a>(
         &'a self,
         record: OperationRecord,
@@ -128,21 +171,70 @@ pub trait OperationStore: Send + Sync {
     fn release(&self);
 }
 
-/// An in-memory store for tests and embedded hosts that need no persistence across process loss. It keeps every record for the life of the process and finds one by scanning, so it is not for a runtime reachable from a network, where the store needs a retention period and a quota.
+/// An in-memory store for tests and embedded hosts that need no persistence across process loss. [`MemoryOperationStore::default`] keeps every record for the life of the process and declares no bounds, so it is not for a runtime reachable from a network. [`MemoryOperationStore::bounded`] enforces a per-caller quota and a retention period. Either way it finds a record by scanning under one lock.
 #[derive(Default)]
 pub struct MemoryOperationStore {
-    records: Mutex<Vec<OperationRecord>>,
+    state: Mutex<MemoryState>,
     owned: Mutex<bool>,
+    bounds: Option<(StoreBounds, Arc<dyn Clock>)>,
+}
+
+#[derive(Default)]
+struct MemoryState {
+    records: Vec<OperationRecord>,
+    /// When each finished record finished, in the bounds' clock. Only kept by a bounded store.
+    finished: std::collections::HashMap<OperationId, u64>,
+}
+
+impl MemoryOperationStore {
+    /// A store that enforces `bounds`, reading time from `clock`.
+    pub fn bounded(bounds: StoreBounds, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            bounds: Some((bounds, clock)),
+            ..Self::default()
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryState> {
+        self.state.lock().expect("store lock is never poisoned")
+    }
+
+    /// Notes that the record finished now, if the store keeps finish times.
+    fn note_finished(&self, state: &mut MemoryState, id: &OperationId) {
+        if let Some((_, clock)) = &self.bounds {
+            state.finished.insert(id.clone(), clock.now());
+        }
+    }
 }
 
 impl OperationStore for MemoryOperationStore {
+    fn bounds(&self) -> Option<StoreBounds> {
+        self.bounds.as_ref().map(|(bounds, _)| *bounds)
+    }
+
     fn reserve<'a>(
         &'a self,
         record: OperationRecord,
     ) -> PortFuture<'a, Result<Reservation, StoreError>> {
         Box::pin(async move {
-            let mut records = self.records.lock().expect("store lock is never poisoned");
-            if let Some(existing) = records
+            let mut state = self.lock();
+            let state = &mut *state;
+            if let Some((bounds, clock)) = &self.bounds {
+                let now = clock.now();
+                let finished = &mut state.finished;
+                state.records.retain(|r| {
+                    let expired = r.scope == record.scope
+                        && finished
+                            .get(&r.id)
+                            .is_some_and(|at| now.saturating_sub(*at) > bounds.retention);
+                    if expired {
+                        finished.remove(&r.id);
+                    }
+                    !expired
+                });
+            }
+            if let Some(existing) = state
+                .records
                 .iter()
                 .find(|r| r.scope == record.scope && r.key == record.key)
             {
@@ -152,7 +244,17 @@ impl OperationStore for MemoryOperationStore {
                     Reservation::Conflict
                 });
             }
-            records.push(record);
+            if let Some((bounds, _)) = &self.bounds {
+                let held = state
+                    .records
+                    .iter()
+                    .filter(|r| r.scope == record.scope)
+                    .count();
+                if held >= bounds.per_caller_records {
+                    return Ok(Reservation::Full);
+                }
+            }
+            state.records.push(record);
             Ok(Reservation::New)
         })
     }
@@ -163,8 +265,10 @@ impl OperationStore for MemoryOperationStore {
         outcome: Outcome,
     ) -> PortFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let mut records = self.records.lock().expect("store lock is never poisoned");
-            let record = records
+            let mut state = self.lock();
+            let state = &mut *state;
+            let record = state
+                .records
                 .iter_mut()
                 .find(|r| &r.id == id)
                 .ok_or_else(|| StoreError("operation not found".into()))?;
@@ -176,6 +280,7 @@ impl OperationStore for MemoryOperationStore {
                 seq,
                 state: OperationState::Completed(outcome),
             });
+            self.note_finished(state, id);
             Ok(())
         })
     }
@@ -184,16 +289,15 @@ impl OperationStore for MemoryOperationStore {
         &'a self,
         id: &'a OperationId,
     ) -> PortFuture<'a, Result<Option<OperationRecord>, StoreError>> {
-        Box::pin(async move {
-            let records = self.records.lock().expect("store lock is never poisoned");
-            Ok(records.iter().find(|r| &r.id == id).cloned())
-        })
+        Box::pin(async move { Ok(self.lock().records.iter().find(|r| &r.id == id).cloned()) })
     }
 
     fn abandon<'a>(&'a self, id: &'a OperationId) -> PortFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let mut records = self.records.lock().expect("store lock is never poisoned");
-            if let Some(record) = records
+            let mut state = self.lock();
+            let state = &mut *state;
+            if let Some(record) = state
+                .records
                 .iter_mut()
                 .find(|r| &r.id == id && r.state() == &OperationState::Accepted)
             {
@@ -202,6 +306,7 @@ impl OperationStore for MemoryOperationStore {
                     seq,
                     state: OperationState::Interrupted,
                 });
+                self.note_finished(state, id);
             }
             Ok(())
         })
@@ -224,9 +329,10 @@ impl OperationStore for MemoryOperationStore {
 
     fn recover<'a>(&'a self) -> PortFuture<'a, Result<Vec<OperationId>, StoreError>> {
         Box::pin(async move {
-            let mut records = self.records.lock().expect("store lock is never poisoned");
+            let mut state = self.lock();
+            let state = &mut *state;
             let mut recovered = Vec::new();
-            for record in records.iter_mut() {
+            for record in state.records.iter_mut() {
                 if record.state() == &OperationState::Accepted {
                     let seq = record.events.len() as u64;
                     record.events.push(OperationEvent {
@@ -235,6 +341,9 @@ impl OperationStore for MemoryOperationStore {
                     });
                     recovered.push(record.id.clone());
                 }
+            }
+            for id in &recovered {
+                self.note_finished(state, id);
             }
             Ok(recovered)
         })
@@ -416,12 +525,17 @@ impl Runtime {
         Self::open_with(dispatcher, store, None).await
     }
 
-    /// As [`Runtime::open`], with at most `limit` operations running at once. The ceiling in `limit` is a timer, so the Tokio runtime must have its time driver enabled.
+    /// As [`Runtime::open`], with at most `limit` operations running at once. The ceiling in `limit` is a timer, so the Tokio runtime must have its time driver enabled. Fails unless the store declares a retention period and a per-caller quota ([`OperationStore::bounds`]), because `limit` bounds operations that are running and not the records a caller can leave stored.
     pub async fn open_limited(
         dispatcher: Arc<Dispatcher>,
         store: Arc<dyn OperationStore>,
         limit: RunningLimit,
     ) -> Result<(Self, Vec<OperationId>), StoreError> {
+        if store.bounds().is_none() {
+            return Err(StoreError(
+                "a runtime opened with a running limit needs a store that declares a retention period and a per-caller quota".into(),
+            ));
+        }
         Self::open_with(dispatcher, store, Some(limit)).await
     }
 
@@ -821,6 +935,7 @@ impl Gate for RuntimeGate<'_> {
                     Admission::Proceed
                 }
                 Ok(Reservation::Conflict) => Admission::Reject(DispatchError::KeyConflict),
+                Ok(Reservation::Full) => Admission::Reject(DispatchError::Unavailable),
                 Ok(Reservation::Existing(existing)) => match existing.state() {
                     OperationState::Completed(outcome) => Admission::Replay(outcome.clone()),
                     OperationState::Accepted if self.another_attempt_is_live(&existing.id) => {

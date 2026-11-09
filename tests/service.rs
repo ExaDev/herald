@@ -1,7 +1,7 @@
 use herald::exposure::{Exposure, Surface};
 use herald::runtime::{
     MemoryOperationStore, OperationId, OperationRecord, OperationState, OperationStore,
-    Reservation, Runtime, StoreError,
+    Reservation, Runtime, StoreBounds, StoreError,
 };
 use herald::service::{
     Executed, MAX_INPUT_BYTES, MAX_KEY_BYTES, MAX_REQUEST_BYTES, Mode as ServiceMode, Principal,
@@ -853,9 +853,31 @@ async fn shutdown_with_a_started_operation_leaves_it_to_recovery_and_the_store_f
     assert_eq!(view.state(), &OperationState::Interrupted);
 }
 
+/// Records one caller may hold in a test that is not about the quota: far above the few keys any such test submits.
+const ROOMY_RECORDS: usize = 1_000;
+/// A retention no test reaches, since the fixed clock never advances.
+const ROOMY_RETENTION: u64 = 1;
+
+struct FixedClock;
+impl herald::Clock for FixedClock {
+    fn now(&self) -> u64 {
+        0
+    }
+}
+
+fn roomy_store() -> Arc<MemoryOperationStore> {
+    Arc::new(MemoryOperationStore::bounded(
+        StoreBounds::new(ROOMY_RECORDS, ROOMY_RETENTION).unwrap(),
+        Arc::new(FixedClock),
+    ))
+}
+
 /// A store whose `complete` fails, so a handler's outcome cannot be recorded.
 struct ForgetfulStore(MemoryOperationStore);
 impl OperationStore for ForgetfulStore {
+    fn bounds(&self) -> Option<StoreBounds> {
+        self.0.bounds()
+    }
     fn reserve<'a>(
         &'a self,
         r: OperationRecord,
@@ -916,6 +938,9 @@ async fn an_outcome_that_could_not_be_recorded_is_flagged_and_store_errors_stay_
     // A store failure on a read reaches the client as a fixed message, never the store's own text.
     struct Failing;
     impl OperationStore for Failing {
+        fn bounds(&self) -> Option<StoreBounds> {
+            None
+        }
         fn reserve<'a>(
             &'a self,
             _: OperationRecord,
@@ -1804,7 +1829,7 @@ async fn a_query_that_never_returns_is_stopped_at_the_ceiling() {
     let d = Arc::new(d);
     let (runtime, _) = Runtime::open_limited(
         d.clone(),
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
         herald::runtime::RunningLimit::new(1, 1, Duration::from_millis(100)).unwrap(),
     )
     .await
@@ -1936,7 +1961,7 @@ async fn a_query_is_stopped_at_the_ceiling_even_when_its_caller_has_gone_away() 
     let d = Arc::new(d);
     let (runtime, _) = Runtime::open_limited(
         d,
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
         herald::runtime::RunningLimit::new(1, 1, Duration::from_secs(60)).unwrap(),
     )
     .await
