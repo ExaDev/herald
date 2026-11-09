@@ -147,7 +147,7 @@ impl From<&DispatchError> for WireError {
                 "the handler's response broke its contract",
             ),
             D::Store(_) => (ErrorCode::Store, "storage failed"),
-            D::Unavailable => (ErrorCode::Unavailable, "too many operations are running"),
+            D::Unavailable => (ErrorCode::Unavailable, "the service is at capacity"),
             D::TimedOut => (ErrorCode::TimedOut, "the query took too long"),
         };
         Self::new(code, message)

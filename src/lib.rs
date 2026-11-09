@@ -102,7 +102,7 @@ pub enum DispatchError {
     KeyConflict,
     /// The operation store failed before the handler started, so nothing ran.
     Store(String),
-    /// The runtime is running as many operations as it is limited to, so nothing was stored or run.
+    /// The runtime is running as many operations as it is limited to, or the caller already stores as many records as its store allows, so nothing was stored or run.
     Unavailable,
     /// A query ran past the runtime's ceiling and was stopped. A query has no side effects, so nothing is unknown.
     TimedOut,

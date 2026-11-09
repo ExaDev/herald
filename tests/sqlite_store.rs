@@ -5,7 +5,7 @@
 
 use herald::runtime::{
     OperationEvent, OperationId, OperationRecord, OperationState, OperationStore, Reservation,
-    Runtime, StoreError,
+    Runtime, StoreBounds, StoreError,
 };
 use herald::{
     Authorizer, Cancellation, CapabilityId, Clock, Confirmer, Contract, DispatchError, Dispatcher,
@@ -69,6 +69,9 @@ fn append(events: &[OperationEvent], state: OperationState) -> Vec<OperationEven
 }
 
 impl OperationStore for Sqlite {
+    fn bounds(&self) -> Option<StoreBounds> {
+        None
+    }
     fn reserve<'a>(
         &'a self,
         r: OperationRecord,

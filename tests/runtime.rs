@@ -1,7 +1,7 @@
 use herald::runtime::{
     MemoryOperationStore, OperationEvent, OperationId, OperationRecord, OperationState,
-    OperationStore, Reservation, RunningLimit, Runtime, Started, StoreError, Submission,
-    SubmitEnvelope, Transport, TransportError,
+    OperationStore, Reservation, RunningLimit, Runtime, Started, StoreBounds, StoreError,
+    Submission, SubmitEnvelope, Transport, TransportError,
 };
 use herald::{
     Authorizer, Cancellation, CapabilityId, Clock, Confirmer, Contract, DispatchError, Dispatcher,
@@ -10,7 +10,7 @@ use herald::{
 use serde_json::json;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -116,6 +116,32 @@ async fn open(d: &Arc<Dispatcher>, store: &Arc<MemoryOperationStore>) -> Runtime
 }
 fn live() -> Cancellation {
     cancellation().1
+}
+
+/// A clock a test moves by hand.
+#[derive(Default)]
+struct HandClock(AtomicU64);
+impl HandClock {
+    fn advance(&self, by: u64) {
+        self.0.fetch_add(by, Ordering::SeqCst);
+    }
+}
+impl Clock for HandClock {
+    fn now(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Records one caller may hold in a test that is not about the quota: far above the few keys any such test submits.
+const ROOMY_RECORDS: usize = 1_000;
+/// A retention no test's hand-moved clock reaches, so a record in a test that is not about retention is never dropped.
+const ROOMY_RETENTION: u64 = u64::MAX;
+
+fn roomy_store() -> Arc<MemoryOperationStore> {
+    Arc::new(MemoryOperationStore::bounded(
+        StoreBounds::new(ROOMY_RECORDS, ROOMY_RETENTION).unwrap(),
+        Arc::new(HandClock::default()),
+    ))
 }
 
 #[tokio::test]
@@ -502,6 +528,9 @@ async fn a_request_cancelled_before_dispatch_leaves_no_record() {
 /// A store that cannot reserve, so nothing may run.
 struct BrokenStore;
 impl OperationStore for BrokenStore {
+    fn bounds(&self) -> Option<StoreBounds> {
+        None
+    }
     fn reserve<'a>(
         &'a self,
         _: OperationRecord,
@@ -875,6 +904,9 @@ struct FailingRecover {
     fail: AtomicBool,
 }
 impl OperationStore for FailingRecover {
+    fn bounds(&self) -> Option<StoreBounds> {
+        self.inner.bounds()
+    }
     fn reserve<'a>(
         &'a self,
         r: OperationRecord,
@@ -990,7 +1022,7 @@ async fn detached_operations_are_bounded_per_caller_and_overall_and_a_retry_of_a
     let (ports, calls, store) = (
         Ports::allowing(),
         Arc::new(AtomicUsize::new(0)),
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
     );
     let runtime = limited(&dispatcher(&ports, &calls, true), &store, 3, 2).await;
     let start = |who: &'static str, key: &'static str| {
@@ -1032,7 +1064,7 @@ async fn a_finished_operation_frees_its_slot() {
     let (ports, calls, store) = (
         Ports::allowing(),
         Arc::new(AtomicUsize::new(0)),
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
     );
     let runtime = limited(&dispatcher(&ports, &calls, false), &store, 1, 1).await;
     for key in ["1", "2", "3"] {
@@ -1049,7 +1081,7 @@ async fn a_handler_still_running_at_the_ceiling_is_stopped_and_recorded_as_inter
     let (ports, calls, store) = (
         Ports::allowing(),
         Arc::new(AtomicUsize::new(0)),
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
     );
     let (runtime, _) = Runtime::open_limited(
         dispatcher(&ports, &calls, true),
@@ -1159,6 +1191,9 @@ impl SlowReads {
 }
 
 impl OperationStore for SlowReads {
+    fn bounds(&self) -> Option<StoreBounds> {
+        self.inner.bounds()
+    }
     fn reserve<'a>(
         &'a self,
         r: OperationRecord,
@@ -1250,7 +1285,7 @@ async fn a_detached_operation_past_the_ceiling_is_interrupted_and_frees_its_slot
     let (ports, calls, store) = (
         Ports::allowing(),
         Arc::new(AtomicUsize::new(0)),
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
     );
     let (runtime, _) = Runtime::open_limited(
         dispatcher(&ports, &calls, true),
@@ -1342,7 +1377,7 @@ async fn a_ceiling_reached_before_the_record_is_reserved_reports_that_nothing_ra
         }),
     )
     .unwrap();
-    let store = Arc::new(MemoryOperationStore::default());
+    let store = roomy_store();
     let (runtime, _) = Runtime::open_limited(
         Arc::new(d),
         store.clone(),
@@ -1451,4 +1486,135 @@ async fn two_spellings_of_the_same_number_are_one_payload_and_an_integer_and_a_f
         .submit(request("a", json!({"n": 1.0})), "other".into(), live())
         .await;
     assert_eq!(float.result, Err(DispatchError::KeyConflict));
+}
+
+fn bounded_store(
+    per_caller_records: usize,
+    retention: u64,
+    clock: &Arc<HandClock>,
+) -> Arc<MemoryOperationStore> {
+    Arc::new(MemoryOperationStore::bounded(
+        StoreBounds::new(per_caller_records, retention).unwrap(),
+        clock.clone(),
+    ))
+}
+
+#[tokio::test]
+async fn a_running_limit_needs_a_store_that_declares_its_bounds() {
+    let (ports, calls) = (Ports::allowing(), Arc::new(AtomicUsize::new(0)));
+    let refused = Runtime::open_limited(
+        dispatcher(&ports, &calls, false),
+        Arc::new(MemoryOperationStore::default()),
+        RunningLimit::new(1, 1, Duration::from_secs(1)).unwrap(),
+    )
+    .await;
+    let Err(error) = refused else {
+        panic!("a store with no bounds was accepted")
+    };
+    assert!(error.0.contains("retention period and a per-caller quota"));
+    let clock = Arc::new(HandClock::default());
+    assert!(
+        Runtime::open_limited(
+            dispatcher(&ports, &calls, false),
+            bounded_store(1, 1, &clock),
+            RunningLimit::new(1, 1, Duration::from_secs(1)).unwrap(),
+        )
+        .await
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn a_caller_at_its_quota_is_turned_away_for_a_new_key_but_not_for_a_replay_or_another_caller()
+{
+    let (ports, calls, clock) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(HandClock::default()),
+    );
+    let store = bounded_store(2, 100, &clock);
+    let runtime = limited(&dispatcher(&ports, &calls, false), &store, 4, 4).await;
+    for key in ["1", "2"] {
+        let done = runtime
+            .submit(request("a", json!({})), key.into(), live())
+            .await;
+        assert!(done.result.is_ok(), "{key}: {:?}", done.result);
+    }
+    let full = runtime
+        .submit(request("a", json!({})), "3".into(), live())
+        .await;
+    assert_eq!(full.result, Err(DispatchError::Unavailable));
+    assert!(runtime.get("a", &full.id).await.unwrap().is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the refused key ran nothing"
+    );
+    let replay = runtime
+        .submit(request("a", json!({})), "1".into(), live())
+        .await;
+    assert!(replay.result.is_ok(), "{:?}", replay.result);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "a replay runs nothing");
+    let other = runtime
+        .submit(request("b", json!({})), "1".into(), live())
+        .await;
+    assert!(other.result.is_ok(), "{:?}", other.result);
+}
+
+#[tokio::test]
+async fn a_finished_record_older_than_the_retention_is_dropped_and_a_running_one_never_is() {
+    let (ports, calls, clock) = (
+        Ports::allowing(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(HandClock::default()),
+    );
+    let store = bounded_store(1, 10, &clock);
+    let runtime = limited(&dispatcher(&ports, &calls, false), &store, 2, 2).await;
+    let first = runtime
+        .submit(request("a", json!({})), "1".into(), live())
+        .await;
+    assert!(first.result.is_ok());
+    clock.advance(10);
+    let at_retention = runtime
+        .submit(request("a", json!({})), "2".into(), live())
+        .await;
+    assert_eq!(
+        at_retention.result,
+        Err(DispatchError::Unavailable),
+        "a record is kept for the whole retention"
+    );
+    clock.advance(1);
+    let after = runtime
+        .submit(request("a", json!({})), "2".into(), live())
+        .await;
+    assert!(after.result.is_ok(), "{:?}", after.result);
+    assert!(runtime.get("a", &first.id).await.unwrap().is_none());
+    runtime.shutdown().await;
+
+    let stalled_clock = Arc::new(HandClock::default());
+    let store = bounded_store(1, 10, &stalled_clock);
+    let runtime = limited(&dispatcher(&ports, &calls, true), &store, 2, 2).await;
+    let Started::Running(running) = runtime
+        .start(request("a", json!({})), "1".into(), live())
+        .await
+    else {
+        panic!("the stalled operation did not start")
+    };
+    stalled_clock.advance(1_000);
+    let refused = runtime
+        .submit(request("a", json!({})), "2".into(), live())
+        .await;
+    assert_eq!(refused.result, Err(DispatchError::Unavailable));
+    assert!(
+        runtime.get("a", &running).await.unwrap().is_some(),
+        "an operation still running is never dropped"
+    );
+    runtime.shutdown().await;
+}
+
+#[test]
+fn store_bounds_that_allow_no_record_or_no_retention_cannot_be_built() {
+    assert!(StoreBounds::new(0, 1).is_err());
+    assert!(StoreBounds::new(1, 0).is_err());
+    assert!(StoreBounds::new(1, 1).is_ok());
 }
