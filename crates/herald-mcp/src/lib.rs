@@ -13,6 +13,8 @@
 //!
 //! Every capability tool declares an output schema, built from the capability's own and the shared result shapes, so a client can check results the same way a client of the HTTP API can.
 //!
+//! rmcp logs each request it receives and each result it returns at `debug` level through `tracing`, and those hold tool arguments, idempotency keys and operation outputs, so a product must not enable `debug` or `trace` logging for the `rmcp` target where its logs are not as private as its data.
+//!
 //! The network transport is stateless: no session is created, so a session id cannot be stolen, replayed or used to end another caller's stream, and a caller cannot open sessions to exhaust the server. Every request is authenticated on its own.
 
 use herald::{
@@ -415,6 +417,13 @@ impl ServerHandler for HeraldMcp {
             Ok(prepared) => prepared,
             Err(error) => return Ok(failure(error)),
         };
+        // rmcp runs this handler on a task of its own that outlives a request the boundary has already answered, so a call stalled in authorisation can arrive here after its request ended. What the client was told ended is not started, whether or not the call asked to detach; an operation that was started stays the runtime's, which a request's end never reaches.
+        if context.ct.is_cancelled() {
+            return Ok(failure(WireError::new(
+                ErrorCode::Cancelled,
+                "cancelled before it ran",
+            )));
+        }
         // A synchronous call ends when the protocol cancels the request. A detached operation outlives the request that started it, so the request's cancellation must not reach it.
         let detached = *prepared.kind() == Kind::Operation && prepared.detach();
         let (cancellation, _stop) = if detached {

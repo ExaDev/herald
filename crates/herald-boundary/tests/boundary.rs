@@ -571,6 +571,10 @@ fn limits_that_admit_nothing_or_leave_no_time_cannot_be_built() {
     let second = Duration::from_secs(1);
     assert!(Limits::new(Duration::ZERO, 1, 1).is_err());
     assert!(Limits::new(second, 0, 0).is_err());
+    // More permits than the semaphore behind the limit can hold would panic when the boundary starts.
+    let too_many = tokio::sync::Semaphore::MAX_PERMITS + 1;
+    assert!(Limits::new(second, too_many, 1).is_err());
+    assert!(Limits::new(second, tokio::sync::Semaphore::MAX_PERMITS, 1).is_ok());
     assert!(
         Limits::new(second, 2, 0).is_err(),
         "a caller must be allowed a request"

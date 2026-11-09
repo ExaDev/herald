@@ -1423,6 +1423,8 @@ async fn a_stalled_handler_keeps_its_slot_after_the_request_deadline(body: Value
     })
     .await
     .expect("the slot came back");
+    // The stalled handler has returned by now, since it held the slot until it did, and the only handler that ran since is the one successful read: a call whose request ended was not started when its authorisation finished.
+    assert_eq!(world.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
