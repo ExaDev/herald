@@ -289,8 +289,6 @@ impl ServerHandler for HeraldMcp {
         _: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // rmcp runs each request on a task of its own that the guard's deadline does not stop, so the request's in-flight slot is held from the first await until this method returns, however long authorisation or storage takes.
-        let _hold = Self::admitted(&context);
         let Some(principal) = self.principal(&context) else {
             // No caller means the handler is running without the boundary that should have named one: a wiring fault, not a failure to authenticate.
             return Err(McpError::internal_error(MISSING_BOUNDARY, None));
@@ -341,8 +339,6 @@ impl ServerHandler for HeraldMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // As in `list_tools`: the slot outlives the guard's deadline for as long as this task is still working. A detached operation hands its work to the runtime, whose own limit bounds it, and this returns at once.
-        let _hold = Self::admitted(&context);
         let Some(principal) = self.principal(&context) else {
             return Ok(failure(WireError::new(
                 ErrorCode::ContractViolation,

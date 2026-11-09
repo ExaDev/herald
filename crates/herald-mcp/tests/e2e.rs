@@ -1385,7 +1385,7 @@ async fn a_synchronous_mcp_call_holds_the_slot_until_its_handler_returns_even_af
     .await
     .expect("the slot came back");
 }
-/// Sends `body` while the gated capability's authorisation stalls, lets the request deadline pass, and checks that the stalled handler still holds the only slot until it returns: the next request is shed with a 503 and the slot comes back once the handler is released.
+/// rmcp runs each request on a task of its own that the guard's deadline does not stop, and the handler's request context carries the in-flight slot the boundary attached to the request, so the slot lives for as long as the handler does. Sends `body` while the gated capability's authorisation stalls, lets the request deadline pass, and checks that the stalled handler still holds the only slot until it returns: the next request is shed with a 503 and the slot comes back once the handler is released.
 async fn a_stalled_handler_keeps_its_slot_after_the_request_deadline(body: Value) {
     let world = world_with(Limits::new(Duration::from_secs(3), 1, 1).unwrap()).await;
     world.gate.armed.store(true, Ordering::SeqCst);
