@@ -35,7 +35,7 @@ fn limits() -> Limits {
 
 const ORIGIN: &str = "https://app.example.test";
 
-/// Holds the authorisation of the `gated` capability until it is released, like a product whose policy store stalls. It holds only once a test arms it, since every listing authorises every exposed capability.
+/// Holds the authorisation of the `gated` query and the `gatedop` operation until it is released, like a product whose policy store stalls. It holds only once a test arms it, since every listing authorises every exposed capability.
 #[derive(Default)]
 struct Gate {
     armed: std::sync::atomic::AtomicBool,
@@ -50,7 +50,7 @@ struct Policy {
 impl Authorizer for Policy {
     fn authorize<'a>(&'a self, r: &'a Request, c: &'a Contract) -> PortFuture<'a, bool> {
         Box::pin(async move {
-            if c.id.name == "gated" && self.gate.armed.load(Ordering::SeqCst) {
+            if c.id.name.starts_with("gated") && self.gate.armed.load(Ordering::SeqCst) {
                 self.gate.entered.fetch_add(1, Ordering::SeqCst);
                 self.gate.release.notified().await;
             }
@@ -200,6 +200,7 @@ async fn world_with(boundary_limits: Limits) -> World {
     for (name, kind, wait, behaviour) in [
         ("read", Kind::Query, false, Behaviour::Succeed),
         ("gated", Kind::Query, false, Behaviour::Succeed),
+        ("gatedop", Kind::Operation, false, Behaviour::Succeed),
         ("write", Kind::Operation, false, Behaviour::Succeed),
         ("slow", Kind::Operation, true, Behaviour::Succeed),
         ("hang", Kind::Query, true, Behaviour::Succeed),
@@ -248,6 +249,7 @@ async fn world_with(boundary_limits: Limits) -> World {
     let exposure = [
         "read",
         "gated",
+        "gatedop",
         "write",
         "slow",
         "hang",
@@ -371,6 +373,7 @@ async fn both_transports_expose_the_same_tools_with_the_same_schemas() {
             "doubts.v1",
             "fails.v1",
             "gated.v1",
+            "gatedop.v1",
             "hang.v1",
             EVENTS_TOOL,
             OPERATION_TOOL,
@@ -1432,6 +1435,16 @@ async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_d
     a_stalled_handler_keeps_its_slot_after_the_request_deadline(json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "gated.v1", "arguments": {}}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn a_detached_mcp_operation_whose_request_ended_in_authorisation_is_not_started() {
+    // A detached start builds its own cancellation, which nothing cancels, so only the check on the request's end stops it: the helper's count of one run is the successful read alone.
+    a_stalled_handler_keeps_its_slot_after_the_request_deadline(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "gatedop.v1", "arguments": {"idempotency_key": "k", "input": {}, "detach": true}}
     }))
     .await;
 }
