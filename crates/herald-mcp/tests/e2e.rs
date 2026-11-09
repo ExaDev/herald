@@ -1385,8 +1385,8 @@ async fn a_synchronous_mcp_call_holds_the_slot_until_its_handler_returns_even_af
     .await
     .expect("the slot came back");
 }
-#[tokio::test]
-async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_deadline() {
+/// Sends `body` while the gated capability's authorisation stalls, lets the request deadline pass, and checks that the stalled handler still holds the only slot until it returns: the next request is shed with a 503 and the slot comes back once the handler is released.
+async fn a_stalled_handler_keeps_its_slot_after_the_request_deadline(body: Value) {
     let world = world_with(Limits::new(Duration::from_secs(3), 1, 1).unwrap()).await;
     world.gate.armed.store(true, Ordering::SeqCst);
     let request = tokio::spawn({
@@ -1396,8 +1396,7 @@ async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_d
             .header("authorization", "Bearer alice-token")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                          "params": {"name": "gated.v1", "arguments": {}}}))
+            .json(&body)
             .send()
     });
     // The handler is waiting in authorisation, before any execution. The request ends at the deadline.
@@ -1425,6 +1424,24 @@ async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_d
     .await
     .expect("the slot came back");
 }
+
+#[tokio::test]
+async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_deadline() {
+    a_stalled_handler_keeps_its_slot_after_the_request_deadline(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "gated.v1", "arguments": {}}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn an_mcp_listing_stalled_in_authorisation_keeps_its_slot_after_the_request_deadline() {
+    a_stalled_handler_keeps_its_slot_after_the_request_deadline(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn a_service_over_an_unbounded_runtime_cannot_be_served_over_a_network() {
     let policy = Arc::new(Policy::default());
