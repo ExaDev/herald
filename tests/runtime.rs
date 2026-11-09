@@ -20,6 +20,8 @@ struct Ports {
     panic_next: AtomicBool,
     /// Deny any request whose input names resource "x", standing in for a per-resource policy.
     deny_x: AtomicBool,
+    /// How many requests the observer was told finished as `Unavailable`.
+    unavailable_reported: AtomicUsize,
 }
 impl Ports {
     fn allowing() -> Arc<Self> {
@@ -27,6 +29,7 @@ impl Ports {
             allow: AtomicBool::new(true),
             panic_next: AtomicBool::new(false),
             deny_x: AtomicBool::new(false),
+            unavailable_reported: AtomicUsize::new(0),
         })
     }
 }
@@ -54,7 +57,11 @@ impl Clock for Ports {
     }
 }
 impl Observer for Ports {
-    fn finished(&self, _: &Request, _: u64, _: &Result<Outcome, DispatchError>) {}
+    fn finished(&self, _: &Request, _: u64, result: &Result<Outcome, DispatchError>) {
+        if matches!(result, Err(DispatchError::Unavailable)) {
+            self.unavailable_reported.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     fn subscription_opened(&self, _: &Request, _: u64, _: &Result<(), DispatchError>) {}
 }
 
@@ -1544,6 +1551,8 @@ async fn a_caller_at_its_quota_is_turned_away_for_a_new_key_but_not_for_a_replay
         .submit(request("a", json!({})), "3".into(), live())
         .await;
     assert_eq!(full.result, Err(DispatchError::Unavailable));
+    // A full quota is a store's verdict after the request was admitted, so the observer is told, as it is of a key conflict.
+    assert_eq!(ports.unavailable_reported.load(Ordering::SeqCst), 1);
     assert!(runtime.get("a", &full.id).await.unwrap().is_none());
     assert_eq!(
         calls.load(Ordering::SeqCst),
