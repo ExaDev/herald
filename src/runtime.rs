@@ -85,17 +85,17 @@ impl OperationRecord {
 /// The result of asking a store to reserve a key.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Reservation {
-    /// The key was free and is now reserved by the offered record.
+    /// The key was free and is now reserved by the offered record. A key is idempotent only while its record is kept: once a finished record has outlived the store's retention the same key is new again and runs the handler again.
     New,
     /// The same scope, key and digest were already reserved.
     Existing(OperationRecord),
     /// The scope and key were reserved for a different payload.
     Conflict,
-    /// The key is new, but the caller already holds its quota of records and none has outlived its retention. Nothing was stored.
+    /// The key is new, but the caller already holds its quota of records and none has outlived its retention. Nothing was stored and nothing runs. The request finishes as `Unavailable` and, unlike a turn-away by the running limit, which happens before the dispatcher is reached, the observer is told, as it is of a key conflict: this is the store's verdict on an admitted request.
     Full,
 }
 
-/// The quota and retention a store enforces so that what it keeps at rest stays bounded per caller. [`RunningLimit`] bounds operations that are running; these bound the ones that are stored, each of which keeps its input.
+/// The quota and retention a store enforces so that what it keeps at rest stays bounded per caller. [`RunningLimit`] bounds operations that are running; these bound the ones that are stored, each of which keeps its input. The bound is per caller, so the total over all callers is not bounded, and a caller that stops submitting keeps its finished records until the store drops them. Retention also bounds idempotency: a key submitted again after its record was dropped is a new operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreBounds {
     per_caller_records: usize,
