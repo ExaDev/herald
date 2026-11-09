@@ -5,7 +5,7 @@ use herald::{
     Authorizer, Cancellation, CapabilityId, Clock, Confirmer, Contract, DispatchError, Dispatcher,
     Handler, Kind, Observer, Outcome, PortFuture, Request, Support,
     exposure::{Exposure, Surface},
-    runtime::{MemoryOperationStore, RunningLimit, Runtime},
+    runtime::{MemoryOperationStore, RunningLimit, Runtime, StoreBounds},
     service::{Principal, Service},
 };
 use herald_boundary::{Authentication, Authenticator, Boundary, Limits, OriginPolicy};
@@ -35,9 +35,10 @@ fn limits() -> Limits {
 
 const ORIGIN: &str = "https://app.example.test";
 
-/// Holds the authorisation of the `gated` capability until it is released, like a product whose policy store stalls.
+/// Holds the authorisation of the `gated` capability until it is released, like a product whose policy store stalls. It holds only once a test arms it, since every listing authorises every exposed capability.
 #[derive(Default)]
 struct Gate {
+    armed: std::sync::atomic::AtomicBool,
     entered: AtomicUsize,
     release: Notify,
 }
@@ -49,7 +50,7 @@ struct Policy {
 impl Authorizer for Policy {
     fn authorize<'a>(&'a self, r: &'a Request, c: &'a Contract) -> PortFuture<'a, bool> {
         Box::pin(async move {
-            if c.id.name == "gated" {
+            if c.id.name == "gated" && self.gate.armed.load(Ordering::SeqCst) {
                 self.gate.entered.fetch_add(1, Ordering::SeqCst);
                 self.gate.release.notified().await;
             }
@@ -142,6 +143,19 @@ impl Authenticator for Tokens {
     }
 }
 
+/// Records one caller may hold in this suite, far above the few keys any test submits.
+const ROOMY_RECORDS: usize = 1_000;
+/// A retention the fixed clock never reaches, so no record is dropped while a test runs.
+const ROOMY_RETENTION: u64 = 1;
+
+/// A store whose bounds this suite does not reach.
+fn roomy_store() -> Arc<MemoryOperationStore> {
+    Arc::new(MemoryOperationStore::bounded(
+        StoreBounds::new(ROOMY_RECORDS, ROOMY_RETENTION).unwrap(),
+        Arc::new(Policy::default()),
+    ))
+}
+
 fn id(name: &str) -> CapabilityId {
     CapabilityId {
         name: name.into(),
@@ -226,7 +240,7 @@ async fn world_with(boundary_limits: Limits) -> World {
     let d = Arc::new(d);
     let (runtime, _) = Runtime::open_limited(
         d.clone(),
-        Arc::new(MemoryOperationStore::default()),
+        roomy_store(),
         RunningLimit::new(64, 64, Duration::from_secs(600)).unwrap(),
     )
     .await
@@ -1373,6 +1387,7 @@ async fn a_synchronous_mcp_call_holds_the_slot_until_its_handler_returns_even_af
 #[tokio::test]
 async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_deadline() {
     let world = world_with(Limits::new(Duration::from_secs(3), 1, 1).unwrap()).await;
+    world.gate.armed.store(true, Ordering::SeqCst);
     let request = tokio::spawn({
         let client = reqwest::Client::new();
         client
@@ -1386,6 +1401,7 @@ async fn an_mcp_call_stalled_in_authorisation_keeps_its_slot_after_the_request_d
     });
     // The handler is waiting in authorisation, before any execution. The request ends at the deadline.
     wait_until(|| world.gate.entered.load(Ordering::SeqCst) == 1).await;
+    world.gate.armed.store(false, Ordering::SeqCst);
     let ended = request.await.unwrap().unwrap();
     assert_eq!(ended.status().as_u16(), 504);
     // The request is gone but the handler task is not, so its slot is still taken and the next request is shed. Without the hold from the first await the deadline would have freed the slot while work was still running.
