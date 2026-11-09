@@ -5,7 +5,7 @@ use herald::{
     Authorizer, Cancellation, CapabilityId, Clock, Confirmer, Contract, DispatchError, Dispatcher,
     Handler, Kind, Observer, Outcome, PortFuture, Request, Support,
     exposure::{Exposure, Surface},
-    runtime::{MemoryOperationStore, RunningLimit, Runtime},
+    runtime::{MemoryOperationStore, RunningLimit, Runtime, StoreBounds},
     service::{Principal, Service},
 };
 use herald_boundary::{Authentication, Authenticator, Boundary, Limits, OriginPolicy};
@@ -162,6 +162,19 @@ async fn world() -> World {
     world_with(None, limits()).await
 }
 
+/// Records one caller may hold in these suites, far above the few keys any test submits.
+const ROOMY_RECORDS: usize = 1_000;
+/// A retention the fixed clock never reaches, so no record is dropped while a test runs.
+const ROOMY_RETENTION: u64 = 1;
+
+/// A store whose bounds these suites do not reach.
+fn roomy_store() -> Arc<MemoryOperationStore> {
+    Arc::new(MemoryOperationStore::bounded(
+        StoreBounds::new(ROOMY_RECORDS, ROOMY_RETENTION).unwrap(),
+        Arc::new(Policy),
+    ))
+}
+
 /// A running limit generous enough that these suites test behaviour, not the limit.
 fn roomy_running_limit() -> RunningLimit {
     RunningLimit::new(64, 64, Duration::from_secs(600)).unwrap()
@@ -214,7 +227,7 @@ async fn world_with(running: Option<RunningLimit>, boundary_limits: Limits) -> W
         .unwrap();
     }
     let d = Arc::new(d);
-    let store = Arc::new(MemoryOperationStore::default());
+    let store = roomy_store();
     let (runtime, _) = match running {
         Some(limit) => Runtime::open_limited(d.clone(), store, limit).await,
         None => Runtime::open_limited(d.clone(), store, roomy_running_limit()).await,
